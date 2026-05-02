@@ -1,0 +1,229 @@
+# =============================================================================
+#  GL4ES — GLES 3.2 Renderer for Minecraft Java 1.12.2 (Zalith Launcher)
+#  GitHub Actions CI/CD  |  NDK r28c  |  arm64-v8a
+# =============================================================================
+
+name: GL4ES GLES 3.2 Renderer (APK)
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:            # Aktifkan trigger manual dari tab Actions
+
+jobs:
+  build-and-repack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ── 2. Java (dibutuhkan oleh Android SDK tools & apksigner) ───────────
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ── 3. Android SDK (sdkmanager, build-tools, zipalign, apksigner) ─────
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # ── 4. Android NDK r28c (latest stable, Clang LLVM r563880c) ──────────
+      #       r28c = 28.2.13676358 — Mendukung 16KB page size secara default
+      - name: Setup Android NDK r28c
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r28c
+          link-to-sdk: true       # Tautkan NDK ke SDK agar cmake toolchain ditemukan otomatis
+
+      # ── 5. Cache direktori build (hemat waktu re-build) ───────────────────
+      - name: Cache CMake Build
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: cmake-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'src/CMakeLists.txt') }}
+          restore-keys: |
+            cmake-${{ runner.os }}-
+
+      # ── 6. Build libGL.so (Native Library) ────────────────────────────────
+      - name: Build Native Library
+        run: |
+          set -euo pipefail
+
+          export ANDROID_NDK_HOME="${{ steps.setup-ndk.outputs.ndk-path }}"
+          NDK_TOOLCHAIN="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+
+          echo ">>> NDK Path  : $ANDROID_NDK_HOME"
+          echo ">>> Toolchain : $NDK_TOOLCHAIN"
+          echo ">>> CPU Cores : $(nproc)"
+
+          # ─── Compiler Flags ───────────────────────────────────────────────
+          # Tidak menggunakan -mcpu=cortex-a53 (terlalu spesifik & lambat di
+          # CPU modern). Gunakan -march=armv8-a+simd+crypto saja agar universal
+          # di semua perangkat arm64 (Cortex-A53 sampai X4).
+          #
+          # -Ofast          : Optimasi agresif (termasuk -ffast-math)
+          # -flto=thin      : Thin LTO (lebih cepat dari full LTO, tetap efektif)
+          # -ffunction-sections / -fdata-sections : Memungkinkan GC dead code
+          # -fomit-frame-pointer                  : Kurangi overhead stack frame
+          # -fno-stack-protector                  : Nonaktifkan overhead security
+          #                                         (aman untuk library internal)
+          # -funroll-loops  : Unroll loop kecil untuk performa
+          C_FLAGS="\
+            -Ofast \
+            -march=armv8-a+simd+crypto \
+            -ffast-math \
+            -fno-math-errno \
+            -ffinite-math-only \
+            -fno-signed-zeros \
+            -fno-trapping-math \
+            -freciprocal-math \
+            -funroll-loops \
+            -fomit-frame-pointer \
+            -fno-stack-protector \
+            -flto=thin \
+            -ffunction-sections \
+            -fdata-sections \
+          "
+
+          # ─── Linker Flags ─────────────────────────────────────────────────
+          # -flto=thin               : Aktifkan Thin LTO di linker juga
+          # -fuse-ld=lld             : Pakai LLD (lebih cepat dari ld.gold/bfd)
+          # --gc-sections            : Buang simbol/fungsi yang tidak dipakai
+          # --fix-cortex-a53-843419  : Patch linker bug Cortex-A53 (untuk kompatibilitas
+          #                            perangkat lama seperti SD430, Helio P10, dst.)
+          # -Wl,-O3                  : Optimasi linker level 3
+          # --as-needed              : Hanya link library yang benar-benar dipakai
+          LINKER_FLAGS="\
+            -flto=thin \
+            -fuse-ld=lld \
+            -Wl,--gc-sections \
+            -Wl,--fix-cortex-a53-843419 \
+            -Wl,-O3 \
+            -Wl,--as-needed \
+          "
+
+          cmake -S . -B build \
+            -Wno-dev \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_TOOLCHAIN" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID=ON \
+            -DNO_GBM=ON \
+            -DUSE_ANDROID_LOG=ON \
+            -G Ninja \
+            -DCMAKE_C_FLAGS="$C_FLAGS" \
+            -DCMAKE_SHARED_LINKER_FLAGS="$LINKER_FLAGS"
+
+          cmake --build build -j$(nproc)
+
+          echo ">>> Build selesai. Mencari library..."
+          find lib/ -name "*.so*" 2>/dev/null || find build/ -name "*.so*" 2>/dev/null
+
+      # ── 7. Injeksi .so ke APK ─────────────────────────────────────────────
+      - name: Inject Library & Create APK
+        run: |
+          set -euo pipefail
+
+          # Validasi folder base_apk
+          if [ ! -d "base_apk" ]; then
+            echo "FATAL: Folder 'base_apk' tidak ditemukan!"
+            exit 1
+          fi
+
+          echo ">>> Menyiapkan workspace APK..."
+          rm -rf output_apk
+          mkdir -p output_apk
+          cp -r base_apk/. output_apk/
+          mkdir -p output_apk/lib/arm64-v8a
+
+          # Cari library hasil build (bisa libGL.so.1 atau libGL.so)
+          LIB_SRC=""
+          if   [ -f "lib/libGL.so.1" ]; then LIB_SRC="lib/libGL.so.1"
+          elif [ -f "lib/libGL.so"   ]; then LIB_SRC="lib/libGL.so"
+          elif [ -f "build/lib/libGL.so.1" ]; then LIB_SRC="build/lib/libGL.so.1"
+          elif [ -f "build/lib/libGL.so"   ]; then LIB_SRC="build/lib/libGL.so"
+          else
+            echo "FATAL: Library tidak ditemukan setelah build!"
+            find . -name "*.so*" 2>/dev/null
+            exit 1
+          fi
+
+          echo ">>> Library ditemukan: $LIB_SRC"
+          cp "$LIB_SRC" output_apk/lib/arm64-v8a/libgl4es3.so
+          echo ">>> Ukuran library   : $(du -sh output_apk/lib/arm64-v8a/libgl4es3.so | cut -f1)"
+
+          # Hapus keystore dari APK (tidak boleh masuk zip)
+          rm -f output_apk/*.keystore
+
+          echo ">>> Membuat unsigned.apk..."
+          cd output_apk
+          zip -r ../unsigned.apk . -x "*.keystore"
+          cd ..
+
+          echo ">>> unsigned.apk siap: $(du -sh unsigned.apk | cut -f1)"
+
+      # ── 8. Align & Sign APK ───────────────────────────────────────────────
+      - name: Sign APK
+        run: |
+          set -euo pipefail
+
+          # Temukan build-tools terbaru yang tersedia
+          BUILD_TOOLS_VERSION=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)
+          ZIPALIGN="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/zipalign"
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+
+          echo ">>> Build Tools: $BUILD_TOOLS_VERSION"
+
+          # Zipalign (4-byte alignment untuk APK yang efisien)
+          echo ">>> Zipalign..."
+          "$ZIPALIGN" -v -p 4 unsigned.apk aligned.apk
+
+          # Validasi keystore
+          KEYSTORE="base_apk/my_release.keystore"
+          if [ ! -f "$KEYSTORE" ]; then
+            echo "FATAL: '$KEYSTORE' tidak ditemukan!"
+            echo "Upload keystore ke folder base_apk/ terlebih dahulu."
+            exit 1
+          fi
+
+          echo ">>> Signing APK dengan keystore..."
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE" \
+            --ks-pass  pass:123456 \
+            --key-pass pass:123456 \
+            --ks-key-alias mykey \
+            --out GL4ES-Wrapper.apk \
+            aligned.apk
+
+          echo ">>> Verifikasi tanda tangan..."
+          "$APKSIGNER" verify GL4ES-Wrapper.apk && echo "Signature OK!" || {
+            echo "FATAL: Verifikasi signature gagal!"
+            exit 1
+          }
+
+          echo ""
+          echo "=========================================="
+          echo " GL4ES-Wrapper.apk berhasil dibuat!"
+          echo " Ukuran: $(du -sh GL4ES-Wrapper.apk | cut -f1)"
+          echo "=========================================="
+
+      # ── 9. Upload Artifact ────────────────────────────────────────────────
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GL4ES-GLES32-Renderer-arm64-v8a
+          path: GL4ES-Wrapper.apk
+          retention-days: 30
+          if-no-files-found: error
