@@ -1054,7 +1054,19 @@ void APIENTRY_GL4ES gl4es_glRenderbufferStorage(GLenum target, GLenum internalfo
     DBG(CheckGLError(1);)
 }
 
-void APIENTRY_GL4ES gl4es_glRenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height) {    //STUB
+void APIENTRY_GL4ES gl4es_glRenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height) {
+    // ES3.0+: glRenderbufferStorageMultisample adalah core — pakai native langsung
+    // ES2.0 : MSAA tidak tersedia sebagai core, fallback ke non-MSAA storage
+    if (hardext.esversion >= 3 && hardext.maxsamples > 0) {
+        LOAD_GLES2(glRenderbufferStorageMultisample);
+        if (gles_glRenderbufferStorageMultisample) {
+            // Clamp samples ke maxsamples yang didukung hardware
+            GLsizei s = (samples > hardext.maxsamples) ? hardext.maxsamples : samples;
+            gles_glRenderbufferStorageMultisample(target, s, internalformat, width, height);
+            return;
+        }
+    }
+    // Fallback: non-MSAA (ES2 atau hardware tanpa MSAA support)
     gl4es_glRenderbufferStorage(target, internalformat, width, height);
 }
 

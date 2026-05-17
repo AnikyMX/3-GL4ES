@@ -29,6 +29,16 @@
 #ifdef TEXSTREAM
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+
+// ── ES3 Half-float compat ──────────────────────────────────────────────────
+// ES3.0+ core: GL_HALF_FLOAT (0x140B) digunakan langsung
+// ES2.0 OES  : GL_HALF_FLOAT_OES (0x8D61) untuk extension path
+// gl4es menggunakan GL_HALF_FLOAT_OES secara internal — kedua nilai diterima
+// oleh ES3 driver karena gl4es menghapus/remap OES → core di upload path
+#define GL4ES_HALF_FLOAT_TYPE(esver) \
+    ((esver) >= 3 ? GL_HALF_FLOAT : GL_HALF_FLOAT_OES)
+
+
 #endif
 
 // expand non-power-of-two sizes

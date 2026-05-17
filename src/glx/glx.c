@@ -174,6 +174,11 @@ static void delete_native_window(void* win) {
 }
 
 #ifndef NOEGL
+static EGLint egl_context_attrib_es3[] = {
+    EGL_CONTEXT_MAJOR_VERSION, 3,
+    EGL_CONTEXT_MINOR_VERSION, 2,
+    EGL_NONE
+};
 static EGLint egl_context_attrib_es2[] = {
     EGL_CONTEXT_CLIENT_VERSION, 2,
     EGL_NONE
@@ -447,7 +452,7 @@ static void init_eglconfig(Display *display) {
     LOAD_EGL(eglChooseConfig);
     LOAD_EGL(eglGetConfigAttrib);
     EGLint configAttribs[] = {
-        EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:EGL_OPENGL_ES2_BIT,
+        EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:(hardext.esversion>=3)?EGL_OPENGL_ES3_BIT:EGL_OPENGL_ES2_BIT,
         EGL_NONE
     };
     int configsFound;
@@ -724,7 +729,7 @@ GLXContext gl4es_glXCreateContext(Display *display,
         EGL_ALPHA_SIZE, (hardext.eglnoalpha)?0:glxfbconfig->alphaBits,
 #endif
         EGL_DEPTH_SIZE, depthBits,
-        EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:EGL_OPENGL_ES2_BIT,
+        EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:(hardext.esversion>=3)?EGL_OPENGL_ES3_BIT:EGL_OPENGL_ES2_BIT,
         //EGL_BUFFER_SIZE, depthBits,
         EGL_STENCIL_SIZE, glxfbconfig->stencilBits,
 
@@ -783,7 +788,7 @@ GLXContext gl4es_glXCreateContext(Display *display,
         return 0;
     }
     EGLContext shared = (shareList)?shareList->eglContext:EGL_NO_CONTEXT;
-	fake->eglContext = egl_eglCreateContext(eglDisplay, fake->eglConfigs[fake->eglconfigIdx], shared, (hardext.esversion==1)?egl_context_attrib:egl_context_attrib_es2);
+	fake->eglContext = egl_eglCreateContext(eglDisplay, fake->eglConfigs[fake->eglconfigIdx], shared, (hardext.esversion==1)?egl_context_attrib:(hardext.esversion>=3)?egl_context_attrib_es3:egl_context_attrib_es2);
 
     CheckEGLErrors();
 
@@ -816,7 +821,7 @@ GLXContext createPBufferContext(Display *display, GLXContext shareList, GLXFBCon
         EGL_BLUE_SIZE, (config)?config->blueBits:0,
         EGL_ALPHA_SIZE, (hardext.eglnoalpha)?0:((config)?config->alphaBits:0),
         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-        EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:EGL_OPENGL_ES2_BIT,
+        EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:(hardext.esversion>=3)?EGL_OPENGL_ES3_BIT:EGL_OPENGL_ES2_BIT,
         EGL_SAMPLE_BUFFERS, (config)?config->nMultiSampleBuffers:0,
         EGL_SAMPLES, (config)?config->multiSampleSize:0,
         EGL_NONE
@@ -856,7 +861,7 @@ GLXContext createPBufferContext(Display *display, GLXContext shareList, GLXFBCon
     fake->eglConfigsCount = 1;
     fake->eglconfigIdx = 0;
 
-	fake->eglContext = egl_eglCreateContext(eglDisplay, fake->eglConfigs[0], shared, (hardext.esversion==1)?egl_context_attrib:egl_context_attrib_es2);
+	fake->eglContext = egl_eglCreateContext(eglDisplay, fake->eglConfigs[0], shared, (hardext.esversion==1)?egl_context_attrib:(hardext.esversion>=3)?egl_context_attrib_es3:egl_context_attrib_es2);
 
     CheckEGLErrors();
 
@@ -911,7 +916,7 @@ GLXContext gl4es_glXCreateContextAttribsARB(Display *display, GLXFBConfig config
 #endif
             EGL_SAMPLES, config->multiSampleSize,
             EGL_SAMPLE_BUFFERS, config->nMultiSampleBuffers,
-            EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:EGL_OPENGL_ES2_BIT,
+            EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:(hardext.esversion>=3)?EGL_OPENGL_ES3_BIT:EGL_OPENGL_ES2_BIT,
             EGL_SURFACE_TYPE, globals4es.usepbuffer?EGL_PBUFFER_BIT:type,
             EGL_NONE
         };
@@ -963,7 +968,7 @@ GLXContext gl4es_glXCreateContextAttribsARB(Display *display, GLXFBConfig config
             return fake;
         }
         EGLContext shared = (share_context)?share_context->eglContext:EGL_NO_CONTEXT;
-        fake->eglContext = egl_eglCreateContext(eglDisplay, fake->eglConfigs[fake->eglconfigIdx], shared, (hardext.esversion==1)?egl_context_attrib:egl_context_attrib_es2);
+        fake->eglContext = egl_eglCreateContext(eglDisplay, fake->eglConfigs[fake->eglconfigIdx], shared, (hardext.esversion==1)?egl_context_attrib:(hardext.esversion>=3)?egl_context_attrib_es3:egl_context_attrib_es2);
 
         CheckEGLErrors();
 
@@ -1844,7 +1849,7 @@ GLXFBConfig *gl4es_glXChooseFBConfig(Display *display, int screen,
     attr[1] |= (globals4es.usepbuffer)?(/*EGL_PBUFFER_BIT|*/EGL_PIXMAP_BIT):EGL_WINDOW_BIT;
 
     attr[cur++] = EGL_RENDERABLE_TYPE;
-    attr[cur++] = (hardext.esversion==1)?EGL_OPENGL_ES_BIT:EGL_OPENGL_ES2_BIT;
+    attr[cur++] = (hardext.esversion==1)?EGL_OPENGL_ES_BIT:(hardext.esversion>=3)?EGL_OPENGL_ES3_BIT:EGL_OPENGL_ES2_BIT;
 
     attr[cur++] = EGL_NONE; // end list
 
@@ -1946,7 +1951,7 @@ GLXFBConfig *gl4es_glXGetFBConfigs(Display *display, int screen, int *count) {
     attr[cur++] = EGL_SURFACE_TYPE;
     attr[cur++] = (globals4es.usepbuffer)?(EGL_PBUFFER_BIT|EGL_PIXMAP_BIT):EGL_WINDOW_BIT;
     attr[cur++] = EGL_RENDERABLE_TYPE;
-    attr[cur++] = (hardext.esversion==1)?EGL_OPENGL_ES_BIT:EGL_OPENGL_ES2_BIT;
+    attr[cur++] = (hardext.esversion==1)?EGL_OPENGL_ES_BIT:(hardext.esversion>=3)?EGL_OPENGL_ES3_BIT:EGL_OPENGL_ES2_BIT;
     attr[cur++] = EGL_NONE; // end list
 
     // get the number of EGL config matching!
@@ -2425,7 +2430,7 @@ int createPBuffer(Display * dpy, const EGLint * egl_attribs, EGLSurface* Surface
         EGL_DEPTH_SIZE, 1,
         EGL_STENCIL_SIZE, 1,
         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-        EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:EGL_OPENGL_ES2_BIT,
+        EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:(hardext.esversion>=3)?EGL_OPENGL_ES3_BIT:EGL_OPENGL_ES2_BIT,
         EGL_SAMPLE_BUFFERS, samplebuffers,
         EGL_SAMPLES, samples,
         EGL_NONE
@@ -2455,7 +2460,7 @@ int createPBuffer(Display * dpy, const EGLint * egl_attribs, EGLSurface* Surface
         LOGD("Error creating PBuffer\n");
         return 0;
     }
-    (*Context) = egl_eglCreateContext(eglDisplay, Config[0], EGL_NO_CONTEXT, (hardext.esversion==1)?egl_context_attrib:egl_context_attrib_es2);
+    (*Context) = egl_eglCreateContext(eglDisplay, Config[0], EGL_NO_CONTEXT, (hardext.esversion==1)?egl_context_attrib:(hardext.esversion>=3)?egl_context_attrib_es3:egl_context_attrib_es2);
     CheckEGLErrors();
 
     return 1;
@@ -2568,7 +2573,7 @@ int createPixBuffer(Display * dpy, int bpp, const EGLint * egl_attribs, NativePi
         EGL_DEPTH_SIZE, 1,      // some depth
         EGL_STENCIL_SIZE, 1,    // some stencil too
         EGL_SURFACE_TYPE, EGL_PIXMAP_BIT,
-        EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:EGL_OPENGL_ES2_BIT,
+        EGL_RENDERABLE_TYPE, (hardext.esversion==1)?EGL_OPENGL_ES_BIT:(hardext.esversion>=3)?EGL_OPENGL_ES3_BIT:EGL_OPENGL_ES2_BIT,
         EGL_NONE
     };
 
@@ -2613,7 +2618,7 @@ int createPixBuffer(Display * dpy, int bpp, const EGLint * egl_attribs, NativePi
         return 0;
     }
 
-    (*Context) = egl_eglCreateContext(eglDisplay, pixbufConfigs[0], EGL_NO_CONTEXT, (hardext.esversion==1)?egl_context_attrib:egl_context_attrib_es2);
+    (*Context) = egl_eglCreateContext(eglDisplay, pixbufConfigs[0], EGL_NO_CONTEXT, (hardext.esversion==1)?egl_context_attrib:(hardext.esversion>=3)?egl_context_attrib_es3:egl_context_attrib_es2);
     CheckEGLErrors();
 
     return 1;

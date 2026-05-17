@@ -89,13 +89,6 @@ static const char *gles2_lib[] = {
     NULL
 };
 
-// GLES 3.x library — present on all Android devices with API >= 24.
-// Loaded dynamically so we can fall back to libGLESv2 at runtime if absent.
-static const char *gles3_lib[] = {
-    "libGLESv3",
-    NULL
-};
-
 static const char *gles_lib[] = {
     #if defined(BCMHOST)
     "libbrcmGLESv1_CM",
@@ -181,22 +174,7 @@ void load_libs() {
         }
 #endif
     }
-
-    // --- GLES 3.x path ---
-    // When DEFAULT_ES=3 we first try libGLESv3 (guaranteed on Android API >= 24).
-    // If absent (very old OS / emulator), we silently downgrade to ES 2.0 and
-    // fall through to the regular libGLESv2 load below — zero regressions.
-    if (globals4es.es >= 3) {
-        gles = open_lib(gles3_lib, gles_override);
-        if (!gles) {
-            LOGE("LIBGL: libGLESv3 not found, downgrading backend to ES 2.0\n");
-            globals4es.es = 2;
-        }
-    }
-
-    // --- GLES 2.0 / GLES 1.1 path ---
-    if (!gles)
-        gles = open_lib((globals4es.es==1)?gles_lib:gles2_lib, gles_override);
+    gles = open_lib((globals4es.es==1)?gles_lib:gles2_lib, gles_override);
 #else
     gles = open_lib(L"LIBGL_GLES", L"libGLESv2.dll");
 #endif

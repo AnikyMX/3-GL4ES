@@ -52,3 +52,25 @@ STUB(void,glFeedbackBuffer,(GLsizei size, GLenum type, GLfloat *buffer));
 STUB(void,glEdgeFlagv,(GLboolean *flag));
 //STUB(void glIndexPointer(GLenum  type,  GLsizei  stride,  const GLvoid *  pointer));
 #undef STUB
+
+// =============================================================================
+//  ES3 Compatibility: glDiscardFramebufferEXT → glInvalidateFramebuffer
+//
+//  glDiscardFramebufferEXT adalah ES2 extension. ES3.0+ punya
+//  glInvalidateFramebuffer sebagai core function yang setara.
+//  Kita daftarkan alias agar app yang memanggil EXT versi tetap bekerja.
+// =============================================================================
+#if defined(ANDROID) && !defined(BCMHOST)
+#include "../loader.h"
+void APIENTRY_GL4ES gl4es_glDiscardFramebufferEXT(GLenum target,
+    GLsizei numAttachments, const GLenum *attachments)
+{
+    // Pada ES3+: gunakan glInvalidateFramebuffer (core, lebih efisien)
+    // Pada ES2 : tidak ada implementasi native, diabaikan (hint only)
+    LOAD_GLES2(glInvalidateFramebuffer);
+    if (gles_glInvalidateFramebuffer)
+        gles_glInvalidateFramebuffer(target, numAttachments, attachments);
+}
+AliasExport(void, glDiscardFramebufferEXT,, (GLenum target,
+    GLsizei numAttachments, const GLenum *attachments));
+#endif // ANDROID && !BCMHOST

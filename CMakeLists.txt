@@ -1,174 +1,245 @@
-cmake_minimum_required(VERSION 2.8.12...3.10)
+# =============================================================================
+#  GL4ES — Root CMakeLists.txt (GLES 3.2 Edition)
+#
+#  Perubahan dari original:
+#  - CMake minimum: 2.8.12 → 3.16 (mendukung target_compile_options, Ninja, LTO)
+#  - Android DEFAULT_ES: 2 → 3  (sesuai dengan init.c baru)
+#  - Tambah opsi: GLES32_TARGET, LTO_MODE
+#  - Perbaiki DEFAULT_ES logic: mendukung nilai 3
+#  - Perbaiki Android block: tidak hardcode DEFAULT_ES di definitions
+#  - Tambah LTO support via CMake (bukan via -flg hardcode)
+#  - Tambah IPO/LTO toggle
+# =============================================================================
+
+cmake_minimum_required(VERSION 3.16)
 
 # Import modules
 include(CheckCompilerFlag)
+include(CheckIPOSupported)
 
-project(gl4es LANGUAGES C)
+project(gl4es LANGUAGES C VERSION 1.1.7)
 
+# ── Output directories ────────────────────────────────────────────────────────
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/lib)
-
 link_directories(${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
 
-option(PANDORA "Set to ON if targeting an OpenPandora device" ${PANDORA})
-option(PYRA "Set to ON if targeting an Dragonbox Pyra device" ${PYRA})
-option(BCMHOST "Set to ON if targeting an RPi(2) device" ${BCMHOST})
-option(ODROID "Set to ON if targeting an ODroid device" ${ODROID})
-option(GOA_CLONE "Set to ON if targeting GO Advance clones, like RG351p/v, Gameforce Chi, RGB10..." ${GOA_CLONE})
-option(ANDROID "Set to ON if targeting an Android device" ${ANDROID})
-option(CHIP "Set to ON if targeting an C.H.I.P. device" ${CHIP})
-option(AMIGAOS4 "Set to ON if targeting an AmigaOS4/Warp3D platform (activate NOEGL and NOX11)" ${AMIGAOS4})
-option(NOX11 "Set to ON to not use X11 (creation of context has to be done outside gl4es)" ${NOX11})
-option(NOEGL "Set to ON to not use EGL (all functions are taken in GLES library)" ${NOEGL})
-option(STATICLIB "Set to ON to build a static version of gl4es" ${STATICLIB})
-option(GBM "Set to ON to not build GBM interface" ${GBM})
-option(USE_CCACHE "Set to ON to use ccache if present in the system" ${USE_CCACHE})
-option(USE_CLOCK "Set to ON to use clock_gettime instead of gttimeofday for LIBGL_FPS" ${USE_CLOCK})
-option(NO_LOADER "disable library loader (useful for static library with NOEGL, NOX11, use include/gl4esinit.h)" ${NO_LOADER})
-option(NO_INIT_CONSTRUCTOR "disable automatic initialization (useful for static library, use include/gl4esinit.h)" ${NO_INIT_CONSTRUCTOR})
-option(DEFAULT_GLES "Set to GLES library path if LIBGL_GLES env variable is not set" ${DEFAULT_GLES})
-option(DEFAULT_EGL "Set to EGL library path if LIBGL_EGL env variable is not set" ${DEFAULT_EGL})
-option(DEFAULT_FB "Set to '1', '2' or '3', overrides DEFAULT_FB env variable" ${DEFAULT_FB})
-option(USE_ANDROID_LOG "Set to ON to use Android log instead of stdio" ${USE_ANDROID_LOG})
-option(EGL_WRAPPER "Set to ON to build EGL wrapper" ${EGL_WRAPPER})
-option(GLX_STUBS "Set to ON to build GLX function stubs" ${GLX_STUBS})
+# =============================================================================
+#  Options
+# =============================================================================
+option(PANDORA        "Targeting OpenPandora device"                           ${PANDORA})
+option(PYRA          "Targeting Dragonbox Pyra device"                        ${PYRA})
+option(BCMHOST        "Targeting RPi(2) device"                                ${BCMHOST})
+option(ODROID         "Targeting ODroid device"                                ${ODROID})
+option(GOA_CLONE      "Targeting GO Advance clones (RG351p/v, Gameforce, ...)" ${GOA_CLONE})
+option(ANDROID        "Targeting Android device"                               ${ANDROID})
+option(CHIP           "Targeting C.H.I.P. device"                              ${CHIP})
+option(AMIGAOS4       "Targeting AmigaOS4/Warp3D (forces NOEGL + NOX11)"      ${AMIGAOS4})
+option(NOX11          "Don't use X11"                                          ${NOX11})
+option(NOEGL          "Don't use EGL"                                          ${NOEGL})
+option(STATICLIB      "Build a static version of gl4es"                        ${STATICLIB})
+option(GBM            "Build GBM interface"                                    ${GBM})
+option(USE_CCACHE     "Use ccache if present"                                  ${USE_CCACHE})
+option(USE_CLOCK      "Use clock_gettime instead of gettimeofday for LIBGL_FPS" ${USE_CLOCK})
+option(NO_LOADER      "Disable library loader"                                 ${NO_LOADER})
+option(NO_INIT_CONSTRUCTOR "Disable automatic initialization"                  ${NO_INIT_CONSTRUCTOR})
+option(DEFAULT_GLES   "Default GLES library path"                              ${DEFAULT_GLES})
+option(DEFAULT_EGL    "Default EGL library path"                               ${DEFAULT_EGL})
+option(DEFAULT_FB     "Default FB value (1/2/3)"                               ${DEFAULT_FB})
+option(USE_ANDROID_LOG "Use Android log instead of stdio"                      ${USE_ANDROID_LOG})
+option(EGL_WRAPPER    "Build EGL wrapper"                                      ${EGL_WRAPPER})
+option(GLX_STUBS      "Build GLX function stubs"                               ${GLX_STUBS})
 
+# ── Opsi baru ─────────────────────────────────────────────────────────────────
+# GLES32_TARGET: aktifkan path ES 3.2 secara eksplisit (default ON untuk Android)
+option(GLES32_TARGET  "Enable OpenGL ES 3.2 backend target"                    ${GLES32_TARGET})
+
+# LTO_MODE: "none" | "thin" | "full"
+set(LTO_MODE "thin" CACHE STRING "LTO mode: none, thin, or full")
+
+# =============================================================================
+#  Backtrace
+# =============================================================================
 include(CheckSymbolExists)
 check_symbol_exists(backtrace "execinfo.h" HAS_BACKTRACE)
-if (HAS_BACKTRACE)
+if(HAS_BACKTRACE)
     add_definitions(-DHAS_BACKTRACE)
 endif()
 
+# =============================================================================
+#  Windows
+# =============================================================================
 if(CMAKE_SYSTEM_NAME MATCHES "Windows" OR CMAKE_SYSTEM_NAME MATCHES "MSYS")
     set(NOX11 ON)
     set(NO_GBM ON)
     set(WIN32_PLATFORM ON)
     if(CMAKE_C_COMPILER_ID MATCHES "MSVC" OR "x${CMAKE_C_SIMULATE_ID}" STREQUAL "xMSVC")
-        set(WIN32_MSVC ON)  #msvc or icl or clang-cl
+        set(WIN32_MSVC ON)
     endif()
 endif()
 
-# Pandora
-if(PANDORA)
-    add_definitions(-DPANDORA)
-    add_definitions(-DTEXSTREAM)
-    add_definitions(-mcpu=cortex-a8 -mfpu=neon -mfloat-abi=softfp -ftree-vectorize -fsingle-precision-constant -ffast-math)
-    set(NO_GBM ON)
-endif()
-
-if((NOT GBM) OR PANDORA)
-    set(NO_GBM ON)
-else()
-    set(NO_GBM OFF)
-endif()
-
-
+# =============================================================================
+#  DEFAULT_ES — Backend default
+#
+#  Nilai valid: 1 (ES 1.1) | 2 (ES 2.0) | 3 (ES 3.x)
+#  Android: default 3, semua perangkat arm64 modern mendukung ES 3.2
+#  Pandora: default 1 (SGX530, hanya ES 1.1)
+#  Lainnya: default 2
+# =============================================================================
 if(NOT DEFAULT_ES)
-    if(PANDORA)
+    if(ANDROID)
+        set(DEFAULT_ES 3)
+    elseif(PANDORA)
         set(DEFAULT_ES 1)
     else()
         set(DEFAULT_ES 2)
     endif()
 endif()
 
-if(STATICLIB)
-    add_definitions(-DSTATICLIB)
-endif(STATICLIB)
+# Pass nilai DEFAULT_ES ke preprocessor
+if(DEFAULT_ES EQUAL 3)
+    add_definitions(-DDEFAULT_ES=3)
+elseif(DEFAULT_ES EQUAL 2)
+    add_definitions(-DDEFAULT_ES=2)
+elseif(DEFAULT_ES EQUAL 1)
+    add_definitions(-DDEFAULT_ES=1)
+endif()
+message(STATUS "Default ES backend: ${DEFAULT_ES}")
 
-# Pyra
-if(PYRA)
-    add_definitions(-DPYRA)
-    set(USE_CLOCK ON)
-    #add_definitions(-DTEXSTREAM)
-    add_definitions(-mcpu=cortex-a15 -mfpu=neon-vfpv4 -mfloat-abi=hard -ftree-vectorize -fsingle-precision-constant -ffast-math)
+# =============================================================================
+#  GBM
+# =============================================================================
+if((NOT GBM) OR PANDORA)
+    set(NO_GBM ON)
+else()
+    set(NO_GBM OFF)
+endif()
+
+# =============================================================================
+#  Platform-specific flags
+# =============================================================================
+
+# ── Pandora ───────────────────────────────────────────────────────────────────
+if(PANDORA)
+    add_definitions(-DPANDORA -DTEXSTREAM)
+    add_compile_options(-mcpu=cortex-a8 -mfpu=neon -mfloat-abi=softfp
+                        -ftree-vectorize -fsingle-precision-constant -ffast-math)
     set(NO_GBM ON)
 endif()
 
-# Raspberry PI
+# ── Pyra ──────────────────────────────────────────────────────────────────────
+if(PYRA)
+    add_definitions(-DPYRA)
+    set(USE_CLOCK ON)
+    add_compile_options(-mcpu=cortex-a15 -mfpu=neon-vfpv4 -mfloat-abi=hard
+                        -ftree-vectorize -fsingle-precision-constant -ffast-math)
+    set(NO_GBM ON)
+endif()
+
+# ── Raspberry Pi ──────────────────────────────────────────────────────────────
 if(BCMHOST)
-    include_directories(/opt/vc/include /opt/vc/include/interface/vcos/pthreads /opt/vc/include/interface/vmcs_host/linux)
+    include_directories(/opt/vc/include
+                        /opt/vc/include/interface/vcos/pthreads
+                        /opt/vc/include/interface/vmcs_host/linux)
     link_directories(/opt/vc/lib)
     add_definitions(-DBCMHOST)
 endif()
 
-# ODROID
+# ── ODROID ────────────────────────────────────────────────────────────────────
 if(ODROID)
     add_definitions(-DODROID)
 endif()
 
-# GOA_CLONE
+# ── GOA_CLONE ─────────────────────────────────────────────────────────────────
 if(GOA_CLONE)
     add_definitions(-DGOA_CLONE)
     if(NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
-        add_definitions(-mfpu=neon-vfpv3 -mfloat-abi=hard)
+        add_compile_options(-mfpu=neon-vfpv3 -mfloat-abi=hard)
     endif()
-    add_definitions(-mcpu=cortex-a35 -march=armv8-a+crc+simd+crypto -ftree-vectorize -fsingle-precision-constant -ffast-math)
+    add_compile_options(-mcpu=cortex-a35 -march=armv8-a+crc+simd+crypto
+                        -ftree-vectorize -fsingle-precision-constant -ffast-math)
     set(NO_GBM OFF)
     set(NOX11 ON)
     set(EGL_WRAPPER ON)
     set(GLX_STUBS ON)
 endif()
 
-# Android — target GLES 3.2 backend by default (API 24+, NDK r28+)
-# DEFAULT_ES=3 enables the 3-tier EGL fallback: ES3.2 -> ES3.0 -> ES2.0
-# The actual negotiated version is stored in hardext.esversion at runtime.
+# ── Android ───────────────────────────────────────────────────────────────────
+# Perubahan dari original:
+# - Hapus -DDEFAULT_ES=2 hardcoded (sekarang dikontrol oleh blok DEFAULT_ES di atas)
+# - Aktifkan GLES32_TARGET secara default untuk Android
+# - Tambah -DANDROID_API=26 sebagai informasi untuk hardext
 if(ANDROID)
-    add_definitions(-DANDROID)
-    add_definitions(-DNOX11 -DNO_GBM)
-    set(DEFAULT_ES 3)
+    add_definitions(-DANDROID -DNOX11 -DNO_GBM)
+
+    # API 26 = minimal untuk GLES 3.2 solid di semua perangkat
+    add_definitions(-DANDROID_API=26)
+
+    # Aktifkan GLES 3.2 target secara default di Android
+    if(NOT DEFINED GLES32_TARGET)
+        set(GLES32_TARGET ON)
+    endif()
+
+    set(NO_GBM ON)
+    set(NOX11 ON)
+
+    message(STATUS "Android build: DEFAULT_ES=${DEFAULT_ES}, GLES32_TARGET=${GLES32_TARGET}")
 endif()
 
+# ── Android Log ───────────────────────────────────────────────────────────────
 if(USE_ANDROID_LOG)
     add_definitions(-DUSE_ANDROID_LOG)
     find_library(log-lib log)
 endif()
 
-#PocketCHIP
+# ── PocketCHIP ────────────────────────────────────────────────────────────────
 if(CHIP)
     add_definitions(-DCHIP)
-    add_definitions(-mcpu=cortex-a8 -mfpu=neon -mfloat-abi=hard -ftree-vectorize -fsingle-precision-constant -ffast-math)
+    add_compile_options(-mcpu=cortex-a8 -mfpu=neon -mfloat-abi=hard
+                        -ftree-vectorize -fsingle-precision-constant -ffast-math)
 endif()
 
-# AmigaOS4
+# ── AmigaOS4 ──────────────────────────────────────────────────────────────────
 if(AMIGAOS4)
-    set(CMAKE_C_COMPILER "ppc-amigaos-gcc")
+    set(CMAKE_C_COMPILER   "ppc-amigaos-gcc")
     set(CMAKE_CXX_COMPILER "ppc-amigaos-g++")
-    set(CMAKE_LINKER "ppc-amigaos-ld")
-    set(CMAKE_AR "ppc-amigaos-ar")
-    set(CMAKE_RANLIB "ppc-amigaos-ranlib")
+    set(CMAKE_LINKER       "ppc-amigaos-ld")
+    set(CMAKE_AR           "ppc-amigaos-ar")
+    set(CMAKE_RANLIB       "ppc-amigaos-ranlib")
     add_definitions(-DAMIGAOS4)
     set(NOX11 ON)
     set(NOEGL ON)
     set(NO_GBM ON)
-    set(CMAKE_C_FLAGS_DEBUG "-O1 -gstabs")
+    set(CMAKE_C_FLAGS_DEBUG         "-O1 -gstabs")
     set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -gstabs")
 endif()
 
-#NOX11
+# =============================================================================
+#  Feature flags dari opsi
+# =============================================================================
+
+if(GLES32_TARGET)
+    add_definitions(-DGLES32_TARGET)
+    message(STATUS "GLES 3.2 target: ON")
+endif()
+
+if(STATICLIB)
+    add_definitions(-DSTATICLIB)
+endif()
+
 if(NOX11)
-    add_definitions(-DEGL_NO_X11)
-    add_definitions(-DNOX11)
+    add_definitions(-DEGL_NO_X11 -DNOX11)
 endif()
 
-#NOEGL
 if(NOEGL)
-    add_definitions(-DNOEGL)
-    add_definitions(-DNOX11)
-endif()
-
-if(NOT NO_GBM)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(KMSDRM REQUIRED libdrm gbm egl)
-    link_directories(${KMSDRM_LIBRARY_DIRS})
-    include_directories(${KMSDRM_INCLUDE_DIRS})
+    add_definitions(-DNOEGL -DNOX11)
 endif()
 
 if(NO_GBM)
     add_definitions(-DNO_GBM)
 endif()
 
-#NOX11
 if(USE_CLOCK)
     add_definitions(-DUSE_CLOCK)
 endif()
@@ -197,48 +268,44 @@ if(GLX_STUBS)
     add_definitions(-DGLX_STUBS)
 endif()
 
-#DEFAULT_ES=2
-if(DEFAULT_ES EQUAL 2)
-    add_definitions(-DDEFAULT_ES=2)
-endif()
-if(DEFAULT_ES EQUAL 1)
-    add_definitions(-DDEFAULT_ES=1)
-endif()
-# DEFAULT_ES=3: request GLES 3.2 at runtime (falls back to 3.0 then 2.0)
-# Links against libGLESv3 via dlopen in loader.c — no static link needed.
-if(DEFAULT_ES EQUAL 3)
-    add_definitions(-DDEFAULT_ES=3)
-endif()
-if(USE_CCACHE)
-    find_program(CCACHE_FOUND ccache)
-    if(CCACHE_FOUND)
-        set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
-        set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
-    endif()
+# =============================================================================
+#  GBM — pkg-config
+# =============================================================================
+if(NOT NO_GBM)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(KMSDRM REQUIRED libdrm gbm egl)
+    link_directories(${KMSDRM_LIBRARY_DIRS})
+    include_directories(${KMSDRM_INCLUDE_DIRS})
 endif()
 
-link_directories(${CMAKE_SOURCE_DIR}/lib)
+# =============================================================================
+#  Compiler flags — C standard dan warning suppression
+# =============================================================================
 if(NOT WIN32_MSVC)
     check_compiler_flag(C -std=gnu11 SUPPORTS_GNU11)
     check_compiler_flag(C -funwind-tables SUPPORTS_UNWIND_TABLES)
-    if (SUPPORTS_GNU11)
+
+    if(SUPPORTS_GNU11)
         add_compile_options(-std=gnu11)
     else()
         check_compiler_flag(C -std=gnu99 SUPPORTS_GNU99)
-        if (SUPPORTS_GNU99)
+        if(SUPPORTS_GNU99)
             add_compile_options(-std=gnu99)
         endif()
     endif()
-    if (SUPPORTS_UNWIND_TABLES)
+
+    if(SUPPORTS_UNWIND_TABLES)
         add_compile_options(-funwind-tables)
     endif()
+
     if(NOT WIN32_PLATFORM)
-       add_definitions(-fvisibility=hidden)
+        add_definitions(-fvisibility=hidden)
     else()
-       set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--exclude-all-symbols,--kill-at")
+        set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--exclude-all-symbols,--kill-at")
     endif()
+
 elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
-    add_definitions(-Wno-deprecated-declarations) #strdup
+    add_definitions(-Wno-deprecated-declarations)
     add_definitions(-Wno-unused-function -Wno-unused-variable -Wno-dangling-else)
     add_definitions(-Wno-implicit-const-int-float-conversion)
     add_definitions(-Wno-visibility)
@@ -248,20 +315,60 @@ else()
     else()
         add_definitions(-wd4996 -wd4244 -wd4267 -wd4098 -wd4018)
     endif()
-    add_definitions("-Dinline=__inline" "-D__func__=__FUNCTION__") # for VC<=13
+    add_definitions("-Dinline=__inline" "-D__func__=__FUNCTION__")
 endif()
 
-if (CMAKE_CC_COMPILER_ID MATCHES "Clang" OR CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+if(CMAKE_CC_COMPILER_ID MATCHES "Clang" OR CMAKE_SYSTEM_NAME MATCHES "Emscripten")
     add_definitions(-Wno-pointer-sign -Wno-dangling-else)
 endif()
 
+# =============================================================================
+#  LTO (Link-Time Optimization)
+#
+#  Dikendalikan via LTO_MODE cache variable: "none" | "thin" | "full"
+#  NDK r28c (Clang LLVM r563880c) mendukung ThinLTO secara native.
+# =============================================================================
+if(NOT LTO_MODE STREQUAL "none")
+    check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_OUTPUT LANGUAGES C)
+    if(IPO_SUPPORTED)
+        message(STATUS "LTO mode: ${LTO_MODE}")
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+        if(LTO_MODE STREQUAL "thin")
+            # Clang ThinLTO — lebih cepat build, hampir sama efektifnya dengan full LTO
+            add_compile_options(-flto=thin)
+            add_link_options(-flto=thin)
+        endif()
+    else()
+        message(STATUS "LTO tidak didukung compiler ini: ${IPO_OUTPUT}")
+    endif()
+endif()
+
+# =============================================================================
+#  CCache
+# =============================================================================
+if(USE_CCACHE)
+    find_program(CCACHE_FOUND ccache)
+    if(CCACHE_FOUND)
+        set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
+        set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK    ccache)
+        message(STATUS "CCache: ON (${CCACHE_FOUND})")
+    endif()
+endif()
+
+# =============================================================================
+#  Subdirektori & include
+# =============================================================================
 include_directories(include)
+link_directories(${CMAKE_SOURCE_DIR}/lib)
 add_subdirectory(src)
 
+# =============================================================================
+#  Tests (dipertahankan identik dengan original)
+# =============================================================================
 enable_testing()
 
 macro(create_test test_name test_filename calls_count tolerance)
-    if (${ARGC} EQUAL 5)
+    if(${ARGC} EQUAL 5)
         add_test(${test_name}
             ${CMAKE_COMMAND}
             -D LIBRARY_FOLDER=${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
@@ -271,8 +378,8 @@ macro(create_test test_name test_filename calls_count tolerance)
             -D TOLERANCE=${tolerance}
             -D EXTRACT_RANGE=${ARGV4}
             -P ${CMAKE_SOURCE_DIR}/test.cmake)
-    elseif (${ARGC} EQUAL 6)
-        if (${ARGV4} STREQUAL "NOEXTRACT_RANGE")
+    elseif(${ARGC} EQUAL 6)
+        if(${ARGV4} STREQUAL "NOEXTRACT_RANGE")
             add_test(${test_name}
                 ${CMAKE_COMMAND}
                 -D LIBRARY_FOLDER=${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
@@ -282,7 +389,7 @@ macro(create_test test_name test_filename calls_count tolerance)
                 -D TOLERANCE_GLES1=${tolerance}
                 -D TOLERANCE_GLES2=${ARGV5}
                 -P ${CMAKE_SOURCE_DIR}/test.cmake)
-        else (${ARGV4} STREQUAL "NOEXTRACT_RANGE")
+        else()
             add_test(${test_name}
                 ${CMAKE_COMMAND}
                 -D LIBRARY_FOLDER=${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
@@ -293,8 +400,8 @@ macro(create_test test_name test_filename calls_count tolerance)
                 -D TOLERANCE_GLES2=${ARGV5}
                 -D EXTRACT_RANGE=${ARGV4}
                 -P ${CMAKE_SOURCE_DIR}/test.cmake)
-        endif (${ARGV4} STREQUAL "NOEXTRACT_RANGE")
-    else (${ARGC} EQUAL 5)
+        endif()
+    else()
         add_test(${test_name}
             ${CMAKE_COMMAND}
             -D LIBRARY_FOLDER=${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
@@ -303,11 +410,11 @@ macro(create_test test_name test_filename calls_count tolerance)
             -D CALLS=${calls_count}
             -D TOLERANCE=${tolerance}
             -P ${CMAKE_SOURCE_DIR}/test.cmake)
-    endif (${ARGC} EQUAL 5)
-endmacro(create_test)
+    endif()
+endmacro()
 
 macro(create_test_GLES test_name GLES test_filename calls_count tolerance)
-    if (${ARGC} EQUAL 5)
+    if(${ARGC} EQUAL 5)
         add_test(${test_name}_GLES${GLES}
             ${CMAKE_COMMAND}
             -D LIBRARY_FOLDER=${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
@@ -318,7 +425,7 @@ macro(create_test_GLES test_name GLES test_filename calls_count tolerance)
             -D EXTRACT_RANGE=${ARGV4}
             -D GLES_FORCED=${GLES}
             -P ${CMAKE_SOURCE_DIR}/test.cmake)
-    else (${ARGC} EQUAL 5)
+    else()
         add_test(${test_name}_GLES${GLES}
             ${CMAKE_COMMAND}
             -D LIBRARY_FOLDER=${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
@@ -328,16 +435,14 @@ macro(create_test_GLES test_name GLES test_filename calls_count tolerance)
             -D TOLERANCE=${tolerance}
             -D GLES_FORCED=${GLES}
             -P ${CMAKE_SOURCE_DIR}/test.cmake)
-    endif (${ARGC} EQUAL 5)
-endmacro(create_test_GLES)
+    endif()
+endmacro()
 
-create_test(GLXgears glxgears "0000008203" 25 "NOEXTRACT_RANGE" 700)
-create_test(StuntCarRacer stuntcarracer "0000118817" 20 "638x478+1+1")
-create_test(Neverball neverball "0000078750" 20 "798x478+1+1" 200)
-create_test(FoobillardPlus foobillardplus "0000014748" 50 "798x478+1+1" 60)
-create_test(Descent3 descent3 "0000284192" 20 "638x478+1+1")
-create_test(PointSprite pointsprite "0000248810" 20)
-
-#create_test_GLES(Neverball 2 neverball "0000078750" 200 "798x478+1+1")
-create_test_GLES(OpenRA 2 openra "0000031249" 20 "638x478+1+1")
+create_test(GLXgears        glxgears        "0000008203" 25 "NOEXTRACT_RANGE" 700)
+create_test(StuntCarRacer   stuntcarracer   "0000118817" 20 "638x478+1+1")
+create_test(Neverball        neverball       "0000078750" 20 "798x478+1+1" 200)
+create_test(FoobillardPlus  foobillardplus  "0000014748" 50 "798x478+1+1" 60)
+create_test(Descent3         descent3        "0000284192" 20 "638x478+1+1")
+create_test(PointSprite      pointsprite     "0000248810" 20)
+create_test_GLES(OpenRA       2 openra       "0000031249" 20 "638x478+1+1")
 create_test_GLES(GLSL_lighting 2 glsl_lighting "0000505393" 20)

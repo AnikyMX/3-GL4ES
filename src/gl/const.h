@@ -205,6 +205,12 @@
 #define GL_COMPRESSED_RGBA			   0x84EE
 #define GL_COMPRESSED_TEXTURE_FORMATS  0x86A3
 #define GL_HALF_FLOAT_OES              0x8D61
+// ES3 compat: GL_HALF_FLOAT (core ES3, 0x140B) ≡ GL_HALF_FLOAT_OES di ES3+
+// gl4es menggunakan GL_HALF_FLOAT_OES secara internal untuk konsistensi
+// tetapi driver ES3 menerima GL_HALF_FLOAT (core value) secara native
+#ifndef GL_HALF_FLOAT
+#define GL_HALF_FLOAT                  0x140B
+#endif
 #define GL_RGB565                      0x8D62
 
 // types

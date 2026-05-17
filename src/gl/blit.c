@@ -138,6 +138,7 @@ void gl4es_blitTexture_gles1(GLuint texture,
 
 }
 
+// ── Blit shaders ES2 (GLSL 100) ─────────────────────────────────────────────
 const char _blit_vsh[] = "#version 100                  \n" \
 "attribute highp vec2 aPosition;                        \n" \
 "attribute highp vec2 aTexCoord;                        \n" \
@@ -172,6 +173,57 @@ const char _blit_fsh_alpha[] = "#version 100            \n" \
 "gl_FragColor = p;                                      \n" \
 "}                                                      \n";
 
+// ── Blit shaders ES3 (GLSL 300 es) ───────────────────────────────────────────
+// Digunakan ketika globals4es.glsl_target >= 300 (GLES 3.0+)
+// texture2D() → texture(), attribute/varying → in/out, gl_FragColor → out
+const char _blit_vsh_es3[] =
+    "#version 300 es\n"
+    "layout(location=0) in highp vec2 aPosition;\n"
+    "layout(location=1) in highp vec2 aTexCoord;\n"
+    "out mediump vec2 vTexCoord;\n"
+    "void main(){\n"
+    "  gl_Position = vec4(aPosition.x, aPosition.y, 0.0, 1.0);\n"
+    "  vTexCoord = aTexCoord;\n"
+    "}\n";
+
+const char _blit_fsh_es3[] =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "uniform sampler2D uTex;\n"
+    "in mediump vec2 vTexCoord;\n"
+    "out lowp vec4 fragColor;\n"
+    "void main(){\n"
+    "  fragColor = texture(uTex, vTexCoord);\n"
+    "}\n";
+
+const char _blit_vsh_alpha_es3[] =
+    "#version 300 es\n"
+    "layout(location=0) in highp vec2 aPosition;\n"
+    "layout(location=1) in highp vec2 aTexCoord;\n"
+    "out mediump vec2 vTexCoord;\n"
+    "void main(){\n"
+    "  gl_Position = vec4(aPosition.x, aPosition.y, 0.0, 1.0);\n"
+    "  vTexCoord = aTexCoord;\n"
+    "}\n";
+
+const char _blit_fsh_alpha_es3[] =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "uniform sampler2D uTex;\n"
+    "in mediump vec2 vTexCoord;\n"
+    "out lowp vec4 fragColor;\n"
+    "void main(){\n"
+    "  lowp vec4 p = texture(uTex, vTexCoord);\n"
+    "  if (p.a==0.0) discard;\n"
+    "  fragColor = p;\n"
+    "}\n";
+
+// Selector: pilih shader ES3 atau ES2 berdasarkan glsl_target
+#define BLIT_VSH        (globals4es.glsl_target >= 300 ? _blit_vsh_es3        : _blit_vsh)
+#define BLIT_FSH        (globals4es.glsl_target >= 300 ? _blit_fsh_es3        : _blit_fsh)
+#define BLIT_VSH_ALPHA  (globals4es.glsl_target >= 300 ? _blit_vsh_alpha_es3  : _blit_vsh_alpha)
+#define BLIT_FSH_ALPHA  (globals4es.glsl_target >= 300 ? _blit_fsh_alpha_es3  : _blit_fsh_alpha)
+
 void gl4es_blitTexture_gles2(GLuint texture,
     GLfloat sx, GLfloat sy,
     GLfloat width, GLfloat height, 
@@ -201,7 +253,7 @@ void gl4es_blitTexture_gles2(GLuint texture,
 
         GLint success;
         const char *src[1];
-        src[0] = _blit_fsh;
+        src[0] = BLIT_FSH;
         glstate->blit->pixelshader = gles_glCreateShader( GL_FRAGMENT_SHADER );
         gles_glShaderSource( glstate->blit->pixelshader, 1, (const char**) src, NULL );
         gles_glCompileShader( glstate->blit->pixelshader );
@@ -216,7 +268,7 @@ void gl4es_blitTexture_gles2(GLuint texture,
             glstate->blit = NULL;
         }
     
-        src[0] = _blit_fsh_alpha;
+        src[0] = BLIT_FSH_ALPHA;
         glstate->blit->pixelshader_alpha = gles_glCreateShader( GL_FRAGMENT_SHADER );
         gles_glShaderSource( glstate->blit->pixelshader_alpha, 1, (const char**) src, NULL );
         gles_glCompileShader( glstate->blit->pixelshader_alpha );
@@ -231,7 +283,7 @@ void gl4es_blitTexture_gles2(GLuint texture,
             glstate->blit = NULL;
         }
     
-        src[0] = _blit_vsh;
+        src[0] = BLIT_VSH;
         glstate->blit->vertexshader = gles_glCreateShader( GL_VERTEX_SHADER );
         gles_glShaderSource( glstate->blit->vertexshader, 1, (const char**) src, NULL );
         gles_glCompileShader( glstate->blit->vertexshader );
@@ -246,7 +298,7 @@ void gl4es_blitTexture_gles2(GLuint texture,
             glstate->blit = NULL;
         }
     
-        src[0] = _blit_vsh_alpha;
+        src[0] = BLIT_VSH_ALPHA;
         glstate->blit->vertexshader_alpha = gles_glCreateShader( GL_VERTEX_SHADER );
         gles_glShaderSource( glstate->blit->vertexshader_alpha, 1, (const char**) src, NULL );
         gles_glCompileShader( glstate->blit->vertexshader_alpha );

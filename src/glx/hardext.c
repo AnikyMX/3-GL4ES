@@ -1,3 +1,15 @@
+// =============================================================================
+//  hardext.c — Hardware Capability Detection (GLES 3.2 Edition)
+//
+//  Mendeteksi seluruh kapabilitas backend GLES secara runtime dengan:
+//  1. Membuat EGL PBuffer context ES 3.2 → ES 3.0 → ES 2.0 (fallback chain)
+//  2. Membaca GL_VERSION untuk esversion/esminor yang tepat
+//  3. Iterasi ekstensi via glGetStringi() (GLES 3.0+) atau glGetString()
+//  4. Compile shader uji untuk konfirmasi versi GLSL yang benar-benar jalan
+//
+//  Target: OpenGL ES 3.2, GLSL ES 3.20 (arm64-v8a, Zalith Launcher)
+// =============================================================================
+
 #include "hardext.h"
 
 #include "../gl/debug.h"
@@ -11,57 +23,156 @@
 #include "glx_gbm.h"
 
 #ifndef EGL_PLATFORM_GBM_KHR
-#define EGL_PLATFORM_GBM_KHR                     0x31D7
+#define EGL_PLATFORM_GBM_KHR  0x31D7
 #endif
 
+// EGL_CONTEXT_MINOR_VERSION sudah didefinisikan di egl.h (0x30FB),
+// tapi kita pastikan via fallback jika header lama
+#ifndef EGL_CONTEXT_MINOR_VERSION
+#define EGL_CONTEXT_MINOR_VERSION  0x30FB
+#endif
+
+// ES3-bit untuk eglChooseConfig — dari EGL 1.5 / KHR_create_context
+#ifndef EGL_OPENGL_ES3_BIT
+#define EGL_OPENGL_ES3_BIT  0x00000040
+#endif
+
+// ── State guard ───────────────────────────────────────────────────────────────
 static int tested = 0;
 
+// ── Global instance ───────────────────────────────────────────────────────────
 hardext_t hardext = {0};
 
-char* gl4es_original_vendor = NULL;
+char* gl4es_original_vendor   = NULL;
 char* gl4es_original_renderer = NULL;
 
-static int testGLSL(const char* version, int uniformLoc) {
-    // check if glsl 120 shaders are supported... by compiling one !
+// =============================================================================
+//  Helpers internal
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+//  hasExtension — cek satu ekstensi dari string besar (glGetString path)
+//  Pastikan nama ekstensi diikuti spasi atau '\0' agar tidak false-positive
+//  (misalnya "GL_EXT_draw_buffers" vs "GL_EXT_draw_buffers_indexed")
+// -----------------------------------------------------------------------------
+static int hasExtension(const char* exts, const char* name) {
+    if (!exts || !name) return 0;
+    const char* p = exts;
+    size_t nlen = strlen(name);
+    while ((p = strstr(p, name)) != NULL) {
+        char after = p[nlen];
+        if (after == ' ' || after == '\0')
+            return 1;
+        p += nlen;
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+//  hasExtensionI — cek ekstensi via glGetStringi (GLES 3.0+, lebih akurat)
+//  Menggunakan exact string comparison — tidak perlu khawatir false-positive
+// -----------------------------------------------------------------------------
+static int hasExtensionI(const char* name) {
+    LOAD_GLES2(glGetStringi);
+    LOAD_GLES(glGetIntegerv);
+    if (!gles_glGetStringi) return 0;
+
+    GLint n = 0;
+    gles_glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (GLint i = 0; i < n; i++) {
+        const char* ext = (const char*)gles_glGetStringi(GL_EXTENSIONS, (GLuint)i);
+        if (ext && strcmp(ext, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+// Macro pembantu: cek ekstensi, set field, dan log
+// Gunakan glGetStringi jika GLES3+, fallback ke glGetString
+#define EXT_CHECK_I(NAME, FIELD)                                            \
+    do {                                                                    \
+        if (hardext.esversion >= 3) {                                       \
+            if (hasExtensionI(NAME)) {                                      \
+                hardext.FIELD = 1;                                          \
+                SHUT_LOGD("Extension %s detected and used\n", NAME);        \
+            }                                                               \
+        } else {                                                            \
+            if (hasExtension(Exts, NAME " ")) {                             \
+                hardext.FIELD = 1;                                          \
+                SHUT_LOGD("Extension %s detected and used\n", NAME);        \
+            }                                                               \
+        }                                                                   \
+    } while(0)
+
+// Versi tanpa log "and used" — untuk ekstensi yang hanya dicatat
+#define EXT_DETECT(NAME, FIELD)                                             \
+    do {                                                                    \
+        if (hardext.esversion >= 3) {                                       \
+            if (hasExtensionI(NAME)) {                                      \
+                hardext.FIELD = 1;                                          \
+                SHUT_LOGD("Extension %s detected\n", NAME);                 \
+            }                                                               \
+        } else {                                                            \
+            if (hasExtension(Exts, NAME " ")) {                             \
+                hardext.FIELD = 1;                                          \
+                SHUT_LOGD("Extension %s detected\n", NAME);                 \
+            }                                                               \
+        }                                                                   \
+    } while(0)
+
+// =============================================================================
+//  testGLSL — Compile shader uji untuk konfirmasi versi GLSL yang berjalan
+//  Mengembalikan 1 jika berhasil compile, 0 jika gagal.
+//
+//  Shader yang diuji sengaja sederhana (hanya transform MVP) agar cepat.
+//  Untuk GLSL ES 3.20 kita wajib pakai 'in' bukan 'attribute', dan
+//  texture() bukan texture2D() — inilah yang kita verifikasi.
+// =============================================================================
+static int testGLSL(const char* version_str, int use_in_qualifier) {
     LOAD_GLES2(glCreateShader);
     LOAD_GLES2(glShaderSource);
     LOAD_GLES2(glCompileShader);
     LOAD_GLES2(glGetShaderiv);
     LOAD_GLES2(glDeleteShader);
     LOAD_GLES(glGetError);
+
+    if (!gles_glCreateShader) return 0;
 
     GLuint shad = gles_glCreateShader(GL_VERTEX_SHADER);
-    const char* shadTest[4] = {
-        version,
-        /* Guard with enable (not require) so a missing extension is a warning,
-         * not a hard failure. Correct GLSL syntax: "#extension name : behavior" */
-        "#extension GL_IMG_uniform_buffer_object : enable"
-        "\n"
-        "layout(location = 0) in vec4 vecPos;\n",
-        uniformLoc?"layout(location = 0) uniform mat4 matMVP;\n":"uniform mat4 matMVP;\n",
+    if (!shad) return 0;
+
+    // Pilih qualifier berdasarkan versi:
+    // GLSL ES 1.00 / GLSL 1.20  → "attribute"
+    // GLSL ES 3.00+              → "in"
+    const char* qualifier = use_in_qualifier ? "in" : "attribute";
+
+    // Buffer untuk baris qualifier agar tidak ada alokasi heap
+    char qual_line[64];
+    snprintf(qual_line, sizeof(qual_line), "%s vec4 vecPos;\n", qualifier);
+
+    const char* parts[4] = {
+        version_str,
+        "\n",
+        qual_line,
+        "uniform mat4 matMVP;\n"
         "void main() {\n"
-        " gl_Position = matMVP * vecPos;\n"
+        "    gl_Position = matMVP * vecPos;\n"
         "}\n"
     };
-    gles_glShaderSource(shad, 4, shadTest, NULL);
+    gles_glShaderSource(shad, 4, parts, NULL);
     gles_glCompileShader(shad);
-    GLint compiled;
-    gles_glGetShaderiv(shad, GL_COMPILE_STATUS, &compiled);
-    /*
-    if(!compiled) {
-        LOAD_GLES2(glGetShaderInfoLog)
-        char buff[500];
-        gles_glGetShaderInfoLog(shad, 500, NULL, buff);
-        printf("LIBGL: \"%s\" failed, message:\n%s\n", version, buff);
-    }
-    */
-    gles_glDeleteShader(shad);
-    gles_glGetError();	// reset GL Error
 
-    return compiled;
+    GLint compiled = GL_FALSE;
+    gles_glGetShaderiv(shad, GL_COMPILE_STATUS, &compiled);
+    gles_glDeleteShader(shad);
+    gles_glGetError();  // bersihkan error state
+
+    return (compiled == GL_TRUE) ? 1 : 0;
 }
 
-static int testTextureCubeLod() {
+// Uji khusus: apakah textureCubeLod bekerja tanpa suffix EXT di fragment shader?
+// Beberapa driver PVR lama membutuhkan nama tanpa EXT.
+static int testTextureCubeLod(void) {
     LOAD_GLES2(glCreateShader);
     LOAD_GLES2(glShaderSource);
     LOAD_GLES2(glCompileShader);
@@ -69,87 +180,170 @@ static int testTextureCubeLod() {
     LOAD_GLES2(glDeleteShader);
     LOAD_GLES(glGetError);
 
+    if (!gles_glCreateShader) return 0;
+
     GLuint shad = gles_glCreateShader(GL_FRAGMENT_SHADER);
-    const char* shadTest[3] = {
-        "#version 100",
-        "\n"
+    if (!shad) return 0;
+
+    const char* src =
+        "#version 100\n"
         "#extension GL_EXT_shader_texture_lod : enable\n"
         "uniform samplerCube samCube;\n"
-        "varying mediump vec3 coordCube;\n",
+        "varying mediump vec3 coordCube;\n"
         "void main() {\n"
-        " gl_FragColor = textureCubeLod(samCube, coordCube, 0.0);\n"
-        "}\n"
-    };
-    gles_glShaderSource(shad, 3, shadTest, NULL);
+        "    gl_FragColor = textureCubeLod(samCube, coordCube, 0.0);\n"
+        "}\n";
+
+    gles_glShaderSource(shad, 1, &src, NULL);
     gles_glCompileShader(shad);
-    GLint compiled;
+
+    GLint compiled = GL_FALSE;
     gles_glGetShaderiv(shad, GL_COMPILE_STATUS, &compiled);
     gles_glDeleteShader(shad);
-    gles_glGetError(); // reset GL Error
+    gles_glGetError();
 
-    return compiled;
+    return (compiled == GL_TRUE) ? 1 : 0;
 }
 
+// =============================================================================
+//  parseESVersion — parse string "OpenGL ES X.Y ..." dari glGetString(GL_VERSION)
+//  Output: *major, *minor
+// =============================================================================
+static void parseESVersion(const char* verstr, int* major, int* minor) {
+    *major = 2; *minor = 0;  // default aman
+    if (!verstr) return;
+
+    // Format: "OpenGL ES X.Y ..."
+    const char* p = strstr(verstr, "OpenGL ES ");
+    if (p) {
+        p += 10;  // lewati "OpenGL ES "
+        *major = (int)(*p - '0');
+        if (p[1] == '.' && p[2] >= '0')
+            *minor = (int)(p[2] - '0');
+        return;
+    }
+    // Fallback: coba parse langsung "X.Y"
+    if (verstr[0] >= '1' && verstr[0] <= '3') {
+        *major = (int)(verstr[0] - '0');
+        if (verstr[1] == '.' && verstr[2] >= '0')
+            *minor = (int)(verstr[2] - '0');
+    }
+}
+
+// =============================================================================
+//  detectVendor — deteksi GPU vendor dari GL_VENDOR string
+// =============================================================================
+static int detectVendor(const char* vendor) {
+    if (!vendor) return VEND_UNKNOWN;
+    if (strstr(vendor, "ARM") || strstr(vendor, "Mali"))
+        return VEND_ARM;
+    if (strstr(vendor, "Imagination") || strstr(vendor, "PowerVR"))
+        return VEND_IMGTEC;
+    if (strstr(vendor, "Qualcomm") || strstr(vendor, "Adreno"))
+        return VEND_QUALCOMM;
+    if (strstr(vendor, "Samsung") || strstr(vendor, "Xclipse"))
+        return VEND_SAMSUNG;
+    if (strstr(vendor, "NVIDIA") || strstr(vendor, "Tegra"))
+        return VEND_NVIDIA;
+    if (strstr(vendor, "Broadcom") || strstr(vendor, "VideoCore"))
+        return VEND_BROADCOM;
+    return VEND_UNKNOWN;
+}
+
+// =============================================================================
+//  tryCreateContext — coba buat EGL context dengan versi major.minor tertentu
+//  Mengembalikan context yang valid, atau EGL_NO_CONTEXT jika gagal.
+//
+//  Menggunakan EGL_CONTEXT_MAJOR_VERSION + EGL_CONTEXT_MINOR_VERSION
+//  (EGL 1.5 / KHR_create_context) agar bisa request tepat GLES 3.2.
+// =============================================================================
+static EGLContext tryCreateContext(EGLDisplay dpy, EGLConfig cfg,
+                                   int major, int minor)
+{
+    // EGL_CONTEXT_MAJOR_VERSION = 0x3098 (alias EGL_CONTEXT_CLIENT_VERSION)
+    // EGL_CONTEXT_MINOR_VERSION = 0x30FB (EGL 1.5)
+    const EGLint attribs[] = {
+        0x3098,                  // EGL_CONTEXT_MAJOR_VERSION
+        (EGLint)major,
+        EGL_CONTEXT_MINOR_VERSION,
+        (EGLint)minor,
+        EGL_NONE
+    };
+    LOAD_EGL(eglCreateContext);
+    return egl_eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, attribs);
+}
+
+// =============================================================================
+//  GetHardwareExtensions — entry point utama
+//
+//  notest=1 → mode minimal/offline: isi default tanpa probe hardware.
+//              Dipakai ketika context belum tersedia atau saat testing.
+//  notest=0 → probe penuh: buat EGL PBuffer, detect semua kapabilitas.
+// =============================================================================
 EXPORT
 void GetHardwareExtensions(int notest)
 {
-    if(tested) return;
-    // put some default values
-    hardext.maxtex = 2;
-    hardext.maxsize = 2048;
-    hardext.maxlights = 8;
-    hardext.maxplanes = 6;
+    if (tested) return;
+
+    // ── Nilai default yang selalu aman ──────────────────────────────────────
+    hardext.maxtex         = 2;
+    hardext.maxsize        = 2048;
+    hardext.maxlights      = 8;
+    hardext.maxplanes      = 6;
     hardext.maxdrawbuffers = 1;
+    hardext.maxcolorattach = 1;
+    hardext.maxsamples     = 0;
 
     hardext.esversion = globals4es.es;
-    if(notest) 
-    {
-#ifndef AMIGAOS4
-        SHUT_LOGD("Hardware test disabled, nothing activated...\n");
-#endif
-        if(hardext.esversion>=2) {
-            hardext.maxteximage = 4;
-            hardext.maxvarying = 8;
-            hardext.maxtex = 8;
-            hardext.maxvattrib = 16;
-#ifdef AMIGAOS4
-            hardext.npot = 3;
-#else
-            // ES2: limited NPOT; ES3+ guarantees full NPOT (core feature)
-            hardext.npot = (hardext.esversion>=3) ? 3 : 1;
-#endif
-            hardext.fbo = 1; 
-            hardext.blendcolor = 1;
-            hardext.blendsub = 1;
-            hardext.blendfunc = 1;
-            hardext.blendeq = 1;
-            hardext.mirrored = 1;
-            hardext.pointsprite = 1;
-            hardext.pointsize = 1;
-            hardext.cubemap = 1;
+    hardext.esminor   = 0;
+
+    // ── Mode minimal (notest=1) ─────────────────────────────────────────────
+    if (notest) {
+        SHUT_LOGD("Hardware test disabled, using safe defaults\n");
+        if (hardext.esversion >= 2) {
+            hardext.maxteximage    = 8;
+            hardext.maxvarying     = 8;
+            hardext.maxtex         = 8;
+            hardext.maxvattrib     = 16;
+            hardext.npot           = 1;
+            hardext.fbo            = 1;
+            hardext.blendcolor     = 1;
+            hardext.blendsub       = 1;
+            hardext.blendfunc      = 1;
+            hardext.blendeq        = 1;
+            hardext.mirrored       = 1;
+            hardext.pointsprite    = 1;
+            hardext.pointsize      = 1;
+            hardext.cubemap        = 1;
             hardext.maxdrawbuffers = 1;
-#ifdef AMIGAOS4
-            hardext.glsl300es = 1;
-#else
-            // ES 3.x context guarantees GLSL ES 3.00+ support
-            if(hardext.esversion>=3) {
-                hardext.glsl300es = 1;
-                hardext.glsl310es = 1;
-                // ES 3.2 additionally guarantees GLSL ES 3.20
-                if(hardext.esversion>=3 && hardext.es_minor>=2)
-                    hardext.glsl320es = 1;
-            }
-#endif
+            hardext.elementuint    = 1;
+            hardext.glsl300es      = 0; // tidak diasumsi tanpa probe
+        }
+        if (hardext.esversion >= 3) {
+            hardext.esminor        = 0; // ES 3.0 minimal
+            hardext.pbo            = 1;
+            hardext.ubo            = 1;
+            hardext.vao_native     = 1;
+            hardext.instanced      = 1;
+            hardext.drawbuffers    = 1;
+            hardext.derivatives    = 1;
+            hardext.fragdepth      = 1;
+            hardext.blendminmax    = 1;
+            hardext.etc2           = 1;
+            hardext.texture_storage= 1;
+            hardext.sync_obj       = 1;
+            hardext.glsl300es      = 1;
         }
         return;
     }
+
+    // ── RPi / BCM init (non-Android only) ──────────────────────────────────
 #if defined(BCMHOST) && !defined(ANDROID)
     rpi_init();
 #endif
-#ifdef NOEGL
-    SHUT_LOGD("Hardware test on current Context...\n");
-#else
-    // used EGL & GLES functions
+
+    // ── EGL Setup ──────────────────────────────────────────────────────────
+#ifndef NOEGL
     LOAD_EGL(eglBindAPI);
     LOAD_EGL(eglInitialize);
     LOAD_EGL(eglGetDisplay);
@@ -161,84 +355,12 @@ void GetHardwareExtensions(int notest)
     LOAD_EGL(eglCreateContext);
     LOAD_EGL(eglQueryString);
     LOAD_EGL(eglTerminate);
-    LOAD_EGL(eglGetError);  /* needed to consume errors in 3-tier context fallback */
 
     EGLDisplay eglDisplay;
-    EGLSurface eglSurface;
-    EGLContext eglContext = EGL_NO_CONTEXT;  /* must be initialized — checked after 3-tier block */
+    EGLSurface eglSurface  = EGL_NO_SURFACE;
+    EGLContext eglContext  = EGL_NO_CONTEXT;
 
-    // -------------------------------------------------------------------------
-    // Context attribute arrays for each ES version tier.
-    // EGL_CONTEXT_MAJOR_VERSION_KHR (0x3098) is an alias for
-    // EGL_CONTEXT_CLIENT_VERSION, accepted since EGL_KHR_create_context.
-    // -------------------------------------------------------------------------
-
-    // Tier 1 — ES 3.2: exposes GLSL ES 3.20, native VAO, full NPOT, UBO, etc.
-    EGLint egl_ctx_es32[] = {
-        EGL_CONTEXT_MAJOR_VERSION_KHR, 3,
-        EGL_CONTEXT_MINOR_VERSION_KHR, 2,
-        EGL_NONE
-    };
-    // Tier 2 — ES 3.0: native VAO, UBO, instancing, GLSL ES 3.00
-    EGLint egl_ctx_es30[] = {
-        EGL_CONTEXT_MAJOR_VERSION_KHR, 3,
-        EGL_CONTEXT_MINOR_VERSION_KHR, 0,
-        EGL_NONE
-    };
-    // Tier 3 — ES 2.0: original gl4es behavior, zero regression
-    EGLint egl_ctx_es2[] = {
-        EGL_CONTEXT_CLIENT_VERSION, 2,
-        EGL_NONE
-    };
-    // ES 1.x: no version attribute needed
-    EGLint egl_ctx_es1[] = {
-        EGL_NONE
-    };
-
-    // PBuffer surface dimensions (32x32 is enough for capability probing)
-    EGLint egl_attribs[] = {
-        EGL_WIDTH,  32,
-        EGL_HEIGHT, 32,
-        EGL_NONE
-    };
-
-    // -------------------------------------------------------------------------
-    // Determine the EGL_RENDERABLE_TYPE bit for eglChooseConfig.
-    // EGL_OPENGL_ES3_BIT_KHR (0x0040) is a superset of ES2_BIT — any config
-    // advertising ES3 also supports ES2 contexts, so we never need to re-query
-    // the config when falling back from ES3 to ES2 context creation.
-    // -------------------------------------------------------------------------
-    EGLint renderableType;
-    if (hardext.esversion == 1)
-        renderableType = EGL_OPENGL_ES_BIT;
-    else if (hardext.esversion >= 3)
-        renderableType = EGL_OPENGL_ES3_BIT_KHR;
-    else
-        renderableType = EGL_OPENGL_ES2_BIT;
-
-    EGLint configAttribs[] = {
-#ifdef PANDORA
-        EGL_RED_SIZE,   (hardext.esversion==1) ? 5 : 8,
-        EGL_GREEN_SIZE, (hardext.esversion==1) ? 6 : 8,
-        EGL_BLUE_SIZE,  (hardext.esversion==1) ? 5 : 8,
-        EGL_ALPHA_SIZE, (hardext.esversion==1) ? 0 : 8,
-#else
-        EGL_RED_SIZE,   8,
-        EGL_GREEN_SIZE, 8,
-        EGL_BLUE_SIZE,  8,
-        EGL_ALPHA_SIZE, 8,
-#endif
-        EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,   /* overwritten below */
-        EGL_NONE
-    };
-    // Index of the EGL_RENDERABLE_TYPE *value* (not the token itself).
-    // Layout: RED(0,1) GREEN(2,3) BLUE(4,5) ALPHA(6,7) SURFACE(8,9) RENDER(10,11) NONE(12)
-    configAttribs[11] = renderableType;
-
-    int configsFound;
-    static EGLConfig pbufConfigs[1];
-
+    // ── Display ────────────────────────────────────────────────────────────
 #ifndef NO_GBM
     if (globals4es.usegbm) {
         LoadGBMFunctions();
@@ -249,499 +371,534 @@ void GetHardwareExtensions(int notest)
 
     egl_eglBindAPI(EGL_OPENGL_ES_API);
     if (egl_eglInitialize(eglDisplay, NULL, NULL) != EGL_TRUE) {
-        LOGE("EGL init failed (%s), skipping hardware detection\n", PrintEGLError(0));
+        LOGE("GetHardwareExtensions: eglInitialize failed (%s), "
+             "falling back to safe defaults\n", PrintEGLError(0));
         egl_eglTerminate(eglDisplay);
         return;
     }
 
-    egl_eglChooseConfig(eglDisplay, configAttribs, pbufConfigs, 1, &configsFound);
-
+    // ── GBM / EGL extension check (sebelum context) ────────────────────────
 #ifndef NO_GBM
-    const char* eglExts = egl_eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
-    if (eglExts && strstr(eglExts, "EGL_KHR_platform_gbm ")) {
-        SHUT_LOGD("GBM Surfaces supported%s\n", globals4es.usegbm ? " and used" : "");
-        hardext.gbm = 1;
+    {
+        const char* eglExts = egl_eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+        if (eglExts && hasExtension(eglExts, "EGL_KHR_platform_gbm")) {
+            SHUT_LOGD("EGL: GBM platform supported%s\n",
+                      globals4es.usegbm ? " and used" : "");
+            hardext.gbm = 1;
+        }
     }
 #endif
 
-#ifndef PANDORA
+    // ── Config selection ───────────────────────────────────────────────────
+    // Kita coba dulu dengan EGL_OPENGL_ES3_BIT untuk GLES 3.x
+    // Jika gagal, fallback ke ES2_BIT
+    EGLint configAttribs_es3[] = {
+        EGL_RED_SIZE,        8,
+        EGL_GREEN_SIZE,      8,
+        EGL_BLUE_SIZE,       8,
+        EGL_ALPHA_SIZE,      8,
+        EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        EGL_NONE
+    };
+    EGLint configAttribs_es2[] = {
+        EGL_RED_SIZE,        8,
+        EGL_GREEN_SIZE,      8,
+        EGL_BLUE_SIZE,       8,
+        EGL_ALPHA_SIZE,      8,
+        EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE
+    };
+
+    EGLConfig  pbufConfig  = NULL;
+    EGLint     configsFound = 0;
+    int        using_es3_config = 0;
+
+    // Coba ES3 config dulu
+    egl_eglChooseConfig(eglDisplay, configAttribs_es3, &pbufConfig, 1, &configsFound);
+    if (configsFound > 0) {
+        using_es3_config = 1;
+        SHUT_LOGD("EGL: ES3 config tersedia\n");
+    } else {
+        // Fallback ke ES2 config
+        egl_eglChooseConfig(eglDisplay, configAttribs_es2, &pbufConfig, 1, &configsFound);
+        if (configsFound > 0) {
+            SHUT_LOGD("EGL: ES3 config tidak ada, fallback ke ES2 config\n");
+        }
+    }
+
+    // Coba tanpa alpha jika masih belum dapat config
     if (!configsFound) {
-        // Retry without alpha channel (some drivers omit 8888 PBuffer configs)
-        configAttribs[7] = 0;
-        egl_eglChooseConfig(eglDisplay, configAttribs, pbufConfigs, 1, &configsFound);
+        configAttribs_es3[3*2+1] = 0; // EGL_ALPHA_SIZE = 0
+        egl_eglChooseConfig(eglDisplay, configAttribs_es3, &pbufConfig, 1, &configsFound);
         if (configsFound) {
-            SHUT_LOGD("No alpha in PBuffer config, disabling EGL alpha channel\n");
+            using_es3_config = 1;
             hardext.eglnoalpha = 1;
+            SHUT_LOGD("EGL: No-alpha ES3 config\n");
         }
     }
-    // If ES3 config not found, gracefully downgrade to ES2 config
-    if (!configsFound && hardext.esversion >= 3) {
-        SHUT_LOGD("ES3 EGL config unavailable, downgrading config to ES2\n");
-        configAttribs[11] = EGL_OPENGL_ES2_BIT;
-        configAttribs[7]  = 8;  // restore alpha
-        egl_eglChooseConfig(eglDisplay, configAttribs, pbufConfigs, 1, &configsFound);
-        if (!configsFound) {
-            configAttribs[7] = 0;
-            egl_eglChooseConfig(eglDisplay, configAttribs, pbufConfigs, 1, &configsFound);
-        }
+    if (!configsFound) {
+        configAttribs_es2[3*2+1] = 0;
+        egl_eglChooseConfig(eglDisplay, configAttribs_es2, &pbufConfig, 1, &configsFound);
         if (configsFound) {
-            hardext.esversion = 2;
-            globals4es.es     = 2;
+            hardext.eglnoalpha = 1;
+            SHUT_LOGD("EGL: No-alpha ES2 config\n");
         }
     }
-#endif
 
     if (!configsFound) {
-        SHUT_LOGE("eglChooseConfig failed (%s), skipping hardware detection\n", PrintEGLError(0));
+        LOGE("GetHardwareExtensions: eglChooseConfig gagal (%s)\n",
+             PrintEGLError(0));
         egl_eglTerminate(eglDisplay);
         return;
     }
 
-    // -------------------------------------------------------------------------
-    // 3-Tier EGL context negotiation
-    //   Tier 1: ES 3.2 — modern features, GLSL ES 3.20
-    //   Tier 2: ES 3.0 — VAO/UBO/instancing, GLSL ES 3.00 (fallback)
-    //   Tier 3: ES 2.0 — original gl4es path, guaranteed on all targets
-    // eglCreateContext returns EGL_NO_CONTEXT on failure; no crash, no assert.
-    // -------------------------------------------------------------------------
-    if (hardext.esversion >= 3) {
-        // --- Tier 1: ES 3.2 ---
-        eglContext = egl_eglCreateContext(eglDisplay, pbufConfigs[0],
-                                          EGL_NO_CONTEXT, egl_ctx_es32);
-        if (eglContext) {
-            hardext.es_minor = 2;
-            SHUT_LOGD("EGL ES 3.2 context negotiated successfully\n");
-        } else {
-            egl_eglGetError();  // consume EGL_BAD_MATCH or similar
-            // --- Tier 2: ES 3.0 ---
-            eglContext = egl_eglCreateContext(eglDisplay, pbufConfigs[0],
-                                              EGL_NO_CONTEXT, egl_ctx_es30);
-            if (eglContext) {
-                hardext.es_minor = 0;
-                SHUT_LOGD("EGL ES 3.0 context negotiated (ES 3.2 unavailable)\n");
-            } else {
-                egl_eglGetError();
-                SHUT_LOGD("ES 3.x context failed, downgrading to ES 2.0\n");
-                // Tier 3 path: set version to 2 so the block below handles it
-                hardext.esversion = 2;
-                globals4es.es     = 2;
+    // ── Context creation: coba GLES 3.2 → 3.1 → 3.0 → 2.0 ───────────────
+    int actual_major = 2, actual_minor = 0;
+
+    if (using_es3_config) {
+        // Coba GLES 3.2
+        eglContext = tryCreateContext(eglDisplay, pbufConfig, 3, 2);
+        if (eglContext != EGL_NO_CONTEXT) {
+            actual_major = 3; actual_minor = 2;
+            SHUT_LOGD("EGL: Context GLES 3.2 berhasil dibuat\n");
+        }
+        // Coba GLES 3.1
+        if (eglContext == EGL_NO_CONTEXT) {
+            eglContext = tryCreateContext(eglDisplay, pbufConfig, 3, 1);
+            if (eglContext != EGL_NO_CONTEXT) {
+                actual_major = 3; actual_minor = 1;
+                SHUT_LOGD("EGL: Context GLES 3.1 berhasil dibuat\n");
+            }
+        }
+        // Coba GLES 3.0
+        if (eglContext == EGL_NO_CONTEXT) {
+            eglContext = tryCreateContext(eglDisplay, pbufConfig, 3, 0);
+            if (eglContext != EGL_NO_CONTEXT) {
+                actual_major = 3; actual_minor = 0;
+                SHUT_LOGD("EGL: Context GLES 3.0 berhasil dibuat\n");
             }
         }
     }
-
-    // ES 2.0 / ES 1.x path — either directly requested or downgraded from ES3
-    if (!eglContext) {
-        eglContext = egl_eglCreateContext(eglDisplay, pbufConfigs[0],
-                                          EGL_NO_CONTEXT,
-                                          (hardext.esversion == 1)
-                                              ? egl_ctx_es1
-                                              : egl_ctx_es2);
+    // Fallback GLES 2.0
+    if (eglContext == EGL_NO_CONTEXT) {
+        eglContext = tryCreateContext(eglDisplay, pbufConfig, 2, 0);
+        if (eglContext != EGL_NO_CONTEXT) {
+            actual_major = 2; actual_minor = 0;
+            SHUT_LOGD("EGL: Context GLES 2.0 (fallback)\n");
+        }
     }
 
-    if (!eglContext) {
-        SHUT_LOGE("eglCreateContext failed (%s), skipping hardware detection\n",
-                  PrintEGLError(0));
+    if (eglContext == EGL_NO_CONTEXT) {
+        LOGE("GetHardwareExtensions: Tidak bisa buat context EGL (%s)\n",
+             PrintEGLError(0));
         egl_eglTerminate(eglDisplay);
         return;
     }
 
-    eglSurface = egl_eglCreatePbufferSurface(eglDisplay, pbufConfigs[0], egl_attribs);
-    if (!eglSurface) {
-        SHUT_LOGE("eglCreatePbufferSurface failed (%s)\n", PrintEGLError(0));
+    // ── PBuffer surface ────────────────────────────────────────────────────
+    const EGLint pbuf_attribs[] = {
+        EGL_WIDTH,  32,
+        EGL_HEIGHT, 32,
+        EGL_NONE
+    };
+    eglSurface = egl_eglCreatePbufferSurface(eglDisplay, pbufConfig, pbuf_attribs);
+    if (eglSurface == EGL_NO_SURFACE) {
+        LOGE("GetHardwareExtensions: eglCreatePbufferSurface gagal (%s)\n",
+             PrintEGLError(0));
         egl_eglDestroyContext(eglDisplay, eglContext);
         egl_eglTerminate(eglDisplay);
         return;
     }
 
     egl_eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
-#endif
-    // -------------------------------------------------------------------------
-    // Verify the *actual* ES version the driver negotiated.
-    // We use GL_MAJOR_VERSION / GL_MINOR_VERSION (core in ES 3.x) for precision,
-    // and fall back to parsing glGetString(GL_VERSION) for ES 2.0/1.x.
-    // This guards against drivers that silently downgrade the context version.
-    // -------------------------------------------------------------------------
-    {
-        LOAD_GLES2(glGetIntegerv);
-        LOAD_GLES2(glGetString);
+#endif  // !NOEGL
 
-        if (hardext.esversion >= 3 && gles_glGetIntegerv) {
-            /* GL_MAJOR_VERSION (0x821B) and GL_MINOR_VERSION (0x821C) are core
-             * in ES 3.0+ but may not be in every project header chain.
-             * Use the raw token values with a guard to stay header-independent. */
-#ifndef GL_MAJOR_VERSION
-#define GL_MAJOR_VERSION 0x821B
-#define GL_MINOR_VERSION 0x821C
-#define GL4ES_DEFINED_MAJOR_MINOR
-#endif
-            GLint actual_major = 0, actual_minor = 0;
-            gles_glGetIntegerv(GL_MAJOR_VERSION, &actual_major);
-            gles_glGetIntegerv(GL_MINOR_VERSION, &actual_minor);
-#ifdef GL4ES_DEFINED_MAJOR_MINOR
-#undef GL_MAJOR_VERSION
-#undef GL_MINOR_VERSION
-#undef GL4ES_DEFINED_MAJOR_MINOR
-#endif
-            if (actual_major >= 3) {
-                hardext.esversion = actual_major;
-                hardext.es_minor  = actual_minor;
-            } else if (actual_major > 0) {
-                // Driver silently gave us a lower version
-                SHUT_LOGD("Warning: driver gave ES %d.%d despite ES3 request\n",
-                          actual_major, actual_minor);
-                hardext.esversion = actual_major;
-                hardext.es_minor  = actual_minor;
-                globals4es.es     = actual_major;
-            }
-        } else if (gles_glGetString) {
-            const char *glVer = (const char *)gles_glGetString(GL_VERSION);
-            if (glVer) {
-                // Format: "OpenGL ES <major>.<minor> ..."
-                const char *p = strstr(glVer, "OpenGL ES ");
-                if (p) {
-                    int maj = 0, min = 0;
-                    if (sscanf(p + 10, "%d.%d", &maj, &min) == 2) {
-                        hardext.es_minor = min;
-                        if (maj != hardext.esversion) {
-                            SHUT_LOGD("Warning: esversion mismatch: requested %d, got %d\n",
-                                      hardext.esversion, maj);
-                            hardext.esversion = maj;
-                            globals4es.es     = maj;
-                        }
-                    }
-                }
-            }
-        }
-
-        SHUT_LOGD("GLES backend confirmed: ES %d.%d\n",
-                  hardext.esversion, hardext.es_minor);
-    }
-
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Context aktif sekarang — mulai probe
+    // ─────────────────────────────────────────────────────────────────────────
     tested = 1;
+
     LOAD_GLES(glGetString);
     LOAD_GLES(glGetIntegerv);
     LOAD_GLES(glGetError);
+    LOAD_GLES2(glGetStringi);
 
-    // -------------------------------------------------------------------------
-    // ES 3.0+ deprecates glGetString(GL_EXTENSIONS) — it returns NULL and sets
-    // GL_INVALID_ENUM. We must check for NULL before any strstr() call.
-    // For ES3 contexts, core features are guaranteed without extension lookup.
-    // -------------------------------------------------------------------------
-    const char *Exts = (const char *) gles_glGetString(GL_EXTENSIONS);
-    // Consume any GL_INVALID_ENUM generated by the call above on ES3 contexts
-    gles_glGetError();
+    // ── Parse versi ES yang sesungguhnya dari GL_VERSION ───────────────────
+    // Versi dari context creation bisa berbeda dengan yang dilaporkan driver.
+    // glGetString(GL_VERSION) adalah sumber kebenaran.
+    {
+        const char* verstr = (const char*)gles_glGetString(GL_VERSION);
+        int real_major, real_minor;
+        parseESVersion(verstr, &real_major, &real_minor);
+        SHUT_LOGD("GL_VERSION: %s → ES %d.%d\n",
+                  verstr ? verstr : "NULL", real_major, real_minor);
 
-    // ES3 NPOT: full non-power-of-two is a core feature — no extension needed.
-    if(hardext.esversion >= 3) {
-        hardext.npot = 3;
-        SHUT_LOGD("Full NPOT is core in ES 3.x, enabled\n");
-    } else if(hardext.esversion > 1) {
-        hardext.npot = 1;
+        // Gunakan nilai yang lebih konservatif antara context attrib dan
+        // GL_VERSION yang dilaporkan
+        if (real_major < actual_major ||
+           (real_major == actual_major && real_minor < actual_minor)) {
+            actual_major = real_major;
+            actual_minor = real_minor;
+        }
+        hardext.esversion = actual_major;
+        hardext.esminor   = actual_minor;
     }
 
-    // Safe strstr wrapper — Exts may be NULL on ES3 contexts
-    #define S(A, B, C) if(Exts && strstr(Exts, A)) { hardext.B = 1; SHUT_LOGD("Extension %s detected%s",A, C?" and used\n":"\n"); }
-    if(Exts) {
-        if(strstr(Exts, "GL_APPLE_texture_2D_limited_npot ")) hardext.npot = 1;
-        if(strstr(Exts, "GL_IMG_texture_npot "))              hardext.npot = 1;
-        if(strstr(Exts, "GL_ARB_texture_non_power_of_two ") || strstr(Exts, "GL_OES_texture_npot ")) hardext.npot = 3;
+    SHUT_LOGD("Backend: OpenGL ES %d.%d\n", hardext.esversion, hardext.esminor);
+
+    // ── Ambil string ekstensi (untuk ES < 3.0, satu string panjang) ────────
+    const char* Exts = NULL;
+    if (hardext.esversion < 3) {
+        Exts = (const char*)gles_glGetString(GL_EXTENSIONS);
+        if (!Exts) Exts = "";
     }
-    if(hardext.npot > 0) {
-        SHUT_LOGD("Hardware %s NPOT in use\n", hardext.npot==3?"Full":(hardext.npot==2?"Limited+Mipmap":"Limited"));
+    // Untuk ES 3.0+, kita gunakan glGetStringi via EXT_CHECK_I/hasExtensionI
+
+    // ── Vendor & Renderer ──────────────────────────────────────────────────
+    {
+        const char* vendor = (const char*)gles_glGetString(GL_VENDOR);
+        SHUT_LOGD("GL_VENDOR: %s\n", vendor ? vendor : "NULL");
+        if (!gl4es_original_vendor && vendor)
+            gl4es_original_vendor = strdup(vendor);
+        hardext.vendor = detectVendor(vendor ? vendor : "");
+
+        const char* renderer = (const char*)gles_glGetString(GL_RENDERER);
+        SHUT_LOGD("GL_RENDERER: %s\n", renderer ? renderer : "NULL");
+        if (!gl4es_original_renderer && renderer)
+            gl4es_original_renderer = strdup(renderer);
     }
-    // GL_EXT_blend_minmax is core in ES 3.0
-    if(hardext.esversion >= 3) {
-        hardext.blendminmax = 1;
-        SHUT_LOGD("GL_EXT_blend_minmax is core in ES3, enabled\n");
-    } else {
-        S("GL_EXT_blend_minmax ", blendminmax, 1);
+
+    // =========================================================================
+    //  Fitur yang SELALU tersedia di ES 2.0+ (tidak perlu cek ekstensi)
+    // =========================================================================
+    if (hardext.esversion >= 2) {
+        hardext.fbo         = 1;  SHUT_LOGD("FBO: core ES2+\n");
+        hardext.pointsprite = 1;  SHUT_LOGD("PointSprite: core ES2+\n");
+        hardext.pointsize   = 1;
+        hardext.cubemap     = 1;  SHUT_LOGD("CubeMap: core ES2+\n");
+        hardext.blendcolor  = 1;  SHUT_LOGD("BlendColor: core ES2+\n");
+        hardext.blendsub    = 1;
+        hardext.blendfunc   = 1;
+        hardext.blendeq     = 1;
+        hardext.mirrored    = 1;
+        hardext.elementuint = 1;
+        hardext.maxlights   = 8;   // Disimulasi FPE
+        hardext.maxplanes   = 6;   // Disimulasi FPE
     }
-    if (hardext.esversion>2) {
-        SHUT_LOGD("Extension GL_EXT_draw_buffers is in core ES3, and so used\n");
-        hardext.drawbuffers = 1;
-    } else {
-        S("GL_EXT_draw_buffers ", drawbuffers, 1);
+
+    // =========================================================================
+    //  Fitur yang SELALU tersedia di ES 3.0+ (tidak perlu cek ekstensi)
+    // =========================================================================
+    if (hardext.esversion >= 3) {
+        hardext.drawbuffers     = 1;  SHUT_LOGD("DrawBuffers: core ES3+\n");
+        hardext.blendminmax     = 1;
+        hardext.derivatives     = 1;
+        hardext.fragdepth       = 1;
+        hardext.highp           = 2;  // Selalu tersedia di ES 3.0+
+        hardext.pbo             = 1;  SHUT_LOGD("PBO: core ES3+\n");
+        hardext.ubo             = 1;  SHUT_LOGD("UBO: core ES3+\n");
+        hardext.vao_native      = 1;  SHUT_LOGD("VAO native: core ES3+\n");
+        hardext.instanced       = 1;  SHUT_LOGD("Instanced draw: core ES3+\n");
+        hardext.transform_feedback = 1;
+        hardext.sync_obj        = 1;
+        hardext.texture_storage = 1;
+        hardext.etc2            = 1;  SHUT_LOGD("ETC2/EAC: core ES3+\n");
+        hardext.depthstencil    = 1;
+        hardext.depth24         = 1;
+        hardext.rgba8           = 1;
+        hardext.depthtex        = 1;
+        hardext.npot            = 3;  SHUT_LOGD("Full NPOT: core ES3+\n");
     }
-    /*if(hardext.blendcolor==0) {
-        // try by just loading the function
-        LOAD_GLES_OR_OES(glBlendColor);
-        if(gles_glBlendColor != NULL) {
-            hardext.blendcolor = 1;
-	        SHUT_LOGD("Extension glBlendColor found and used\n");
-	    }
-    }*/ // I don't think this is correct
-    if(hardext.esversion<2) {
-        S("GL_OES_framebuffer_object ", fbo, 1);
-        S("GL_OES_point_sprite ", pointsprite, 1); 
-        S("GL_OES_point_size_array ", pointsize, 0);
-        S("GL_OES_texture_cube_map ", cubemap, 1);
-        S("GL_EXT_blend_color ", blendcolor, 1);
-        S("GL_OES_blend_subtract ", blendsub, 1);
-        S("GL_OES_blend_func_separate ", blendfunc, 1);
-        S("GL_OES_blend_equation_separate ", blendeq, 1);
-        S("GL_OES_texture_mirrored_repeat ", mirrored, 1);  
-    } else {
-        hardext.fbo = 1; 
-        SHUT_LOGD("FBO are in core, and so used\n");
-        hardext.pointsprite = 1;
-        SHUT_LOGD("PointSprite are in core, and so used\n");
-        hardext.pointsize = 1;
-        SHUT_LOGD("CubeMap are in core, and so used\n");
-        hardext.cubemap = 1;
-        SHUT_LOGD("BlendColor is in core, and so used\n");
-        hardext.blendcolor = 1;
-        SHUT_LOGD("Blend Subtract is in core, and so used\n");
-        hardext.blendsub = 1;
-        SHUT_LOGD("Blend Function and Equation Separation is in core, and so used\n");
-        hardext.blendfunc = 1;
-        hardext.blendeq = 1;
-        SHUT_LOGD("Texture Mirrored Repeat is in core, and so used\n");
-        hardext.mirrored = 1;
+
+    // =========================================================================
+    //  Fitur yang SELALU tersedia di ES 3.1+ (tidak perlu cek ekstensi)
+    // =========================================================================
+    if (hardext.esversion == 3 && hardext.esminor >= 1) {
+        hardext.ssbo         = 1;  SHUT_LOGD("SSBO: core ES3.1+\n");
+        hardext.compute_shader = 1;
+        hardext.indirect_draw  = 1;
     }
-    S("GL_OES_mapbuffer ", mapbuffer, 0);
-    // These are all guaranteed core in ES 3.0 — no extension lookup needed.
-    // OES_element_index_uint, OES_packed_depth_stencil, OES_depth24, OES_rgb8_rgba8,
-    // EXT_multi_draw_arrays are all promoted to core by the ES 3.0 specification.
-    if(hardext.esversion >= 3) {
-        hardext.elementuint  = 1;   // 32-bit index buffers
-        hardext.depthstencil = 1;   // packed depth+stencil
-        hardext.depth24      = 1;   // 24-bit depth
-        hardext.rgba8        = 1;   // RGBA8 renderbuffer
-        hardext.multidraw    = 1;   // glMultiDrawArrays/Elements
-        SHUT_LOGD("ES3 core: elementuint, depthstencil, depth24, rgba8, multidraw enabled\n");
-    } else {
-        S("GL_OES_element_index_uint ", elementuint, 1);
-        S("GL_OES_packed_depth_stencil ", depthstencil, 1);
-        S("GL_OES_depth24 ", depth24, 1);
-        S("GL_OES_rgb8_rgba8 ", rgba8, 1);
-        S("GL_EXT_multi_draw_arrays ", multidraw, 0);
+
+    // =========================================================================
+    //  Fitur yang SELALU tersedia di ES 3.2 (tidak perlu cek ekstensi)
+    // =========================================================================
+    if (hardext_is_gles32()) {
+        hardext.geometry_shader    = 1;  SHUT_LOGD("Geometry shader: core ES3.2\n");
+        hardext.tessellation_shader= 1;  SHUT_LOGD("Tessellation: core ES3.2\n");
+        hardext.sample_shading     = 1;
+        hardext.debug              = 1;
+        hardext.blend_eq_advanced  = 1;
+        hardext.astc               = 1;  SHUT_LOGD("ASTC LDR: core ES3.2\n");
+        hardext.floatfbo           = 1;
+        SHUT_LOGD("Backend confirmed: OpenGL ES 3.2\n");
     }
-    if(!globals4es.nobgra) {
-        S("GL_EXT_texture_format_BGRA8888 ", bgra8888, 1);
+
+    // =========================================================================
+    //  Ekstensi opsional — perlu dicek terlepas dari versi
+    // =========================================================================
+
+    // NPOT (override jika belum ES3)
+    if (hardext.esversion < 3) {
+        hardext.npot = 0;
+        if (hasExtension(Exts, "GL_ARB_texture_non_power_of_two ") ||
+            hasExtension(Exts, "GL_OES_texture_npot "))
+            hardext.npot = 3;
+        else if (hasExtension(Exts, "GL_IMG_texture_npot "))
+            hardext.npot = 1;
+        else if (hasExtension(Exts, "GL_APPLE_texture_2D_limited_npot "))
+            hardext.npot = 1;
+        else if (hardext.esversion >= 2)
+            hardext.npot = 1;
+        SHUT_LOGD("NPOT: level=%d\n", hardext.npot);
     }
-    if(!globals4es.nodepthtex) {
-        // OES_depth_texture is core in ES 3.0 (depth textures guaranteed)
-        // OES_texture_stencil8 is core in ES 3.2
-        if(hardext.esversion >= 3) {
-            hardext.depthtex = 1;
-            if(hardext.esversion >= 3 && hardext.es_minor >= 2)
-                hardext.stenciltex = 1;
-            SHUT_LOGD("ES3 core: depthtex enabled%s\n",
-                      hardext.stenciltex ? ", stenciltex enabled" : "");
-        } else {
-            S("GL_OES_depth_texture ", depthtex, 1);
-            S("GL_OES_texture_stencil8 ", stenciltex, 1);
+
+    // Tekstur float/half-float (ES 3.0 tidak membuatnya wajib untuk FBO)
+    if (globals4es.floattex) {
+        EXT_CHECK_I("GL_OES_texture_float",          floattex);
+        EXT_CHECK_I("GL_OES_texture_half_float",     halffloattex);
+        if (hardext.esversion < 3) {
+            EXT_CHECK_I("GL_EXT_color_buffer_float",     floatfbo);
+            EXT_CHECK_I("GL_EXT_color_buffer_half_float",halffloatfbo);
         }
     }
-    S("GL_OES_draw_texture ", drawtex, 1);
-    // GL_EXT_texture_rg (R/RG formats) is core in ES 3.0
-    if(hardext.esversion >= 3) {
-        hardext.rgtex = 1;
-        SHUT_LOGD("ES3 core: rgtex (R/RG texture formats) enabled\n");
-    } else {
-        S("GL_EXT_texture_rg ", rgtex, 1);
+    if (hardext_is_gles32()) {
+        // float FBO adalah core di ES 3.2
+        if (!hardext.floatfbo)
+            hardext.floatfbo = 1;
     }
-    if(globals4es.floattex) {
-        // Float/half-float textures are core in ES 3.0 (with caveats on format names)
-        // GL_EXT_color_buffer_float is core in ES 3.2
-        if(hardext.esversion >= 3) {
-            hardext.floattex     = 1;
-            hardext.halffloattex = 1;
-            if(hardext.esversion >= 3 && hardext.es_minor >= 2) {
-                hardext.floatfbo     = 1;
-                hardext.halffloatfbo = 1;
-                SHUT_LOGD("ES3 core: float/halffloat textures + fbo enabled (ES3.2)\n");
-            } else {
-                SHUT_LOGD("ES3 core: float/halffloat textures enabled (ES3.0)\n");
-                // floatfbo via extension check on ES3.0/3.1 (Exts may be NULL)
-                S("GL_EXT_color_buffer_float ", floatfbo, 1);
-                S("GL_EXT_color_buffer_half_float ", halffloatfbo, 1);
+
+    // BGRA
+    if (!globals4es.nobgra)
+        EXT_CHECK_I("GL_EXT_texture_format_BGRA8888", bgra8888);
+
+    // S3TC/DXT (populer di Adreno & tegra, dibutuhkan beberapa shader MC)
+    EXT_DETECT("GL_EXT_texture_compression_s3tc",    s3tc);
+    if (!hardext.s3tc)
+        EXT_DETECT("GL_EXT_texture_compression_dxt1", s3tc);
+
+    // Depth & stencil textures (jika tidak sudah di-set oleh ES3+ core)
+    if (!globals4es.nodepthtex) {
+        if (!hardext.depthtex)
+            EXT_CHECK_I("GL_OES_depth_texture",      depthtex);
+        EXT_CHECK_I("GL_OES_texture_stencil8",       stenciltex);
+    }
+
+    // RG texture
+    EXT_CHECK_I("GL_EXT_texture_rg",                 rgtex);
+
+    // Anisotropic filtering
+    EXT_CHECK_I("GL_EXT_texture_filter_anisotropic", aniso);
+    if (hardext.aniso) {
+        gles_glGetIntegerv(0x84FF /* GL_MAX_TEXTURE_MAX_ANISOTROPY */, &hardext.aniso);
+        if (gles_glGetError() != GL_NO_ERROR) hardext.aniso = 0;
+        SHUT_LOGD("Anisotropic max: %d\n", hardext.aniso);
+    }
+
+    // Draw texture (ES1 only)
+    EXT_DETECT("GL_OES_draw_texture",                drawtex);
+
+    // Multi draw (batching, berguna untuk chunk MC)
+    EXT_DETECT("GL_EXT_multi_draw_arrays",           multidraw);
+
+    // Map buffer
+    EXT_DETECT("GL_OES_mapbuffer",                   mapbuffer);
+
+    // Program binary
+    EXT_DETECT("GL_OES_get_program_binary",          prgbinary);
+    if (!hardext.prgbinary)
+        EXT_DETECT("GL_OES_get_program",             prgbinary);
+    if (hardext.prgbinary) {
+        gles_glGetIntegerv(0x8741 /* GL_NUM_PROGRAM_BINARY_FORMATS_OES */,
+                           &hardext.prgbin_n);
+        SHUT_LOGD("Program binary formats: %d\n", hardext.prgbin_n);
+    }
+
+    // ARM shader framebuffer fetch
+    EXT_DETECT("GL_ARM_shader_framebuffer_fetch",    shader_fbfetch);
+
+    // Shader LOD (texture lod di fragment)
+    if (!globals4es.noshaderlod) {
+        EXT_CHECK_I("GL_EXT_shader_texture_lod",     shaderlod);
+        if (hardext.shaderlod) {
+            if (testTextureCubeLod()) {
+                hardext.cubelod = 1;
+                SHUT_LOGD("textureCubeLod: tanpa suffix EXT\n");
             }
-        } else {
-            S("GL_OES_texture_float ", floattex, 1);
-            S("GL_OES_texture_half_float ", halffloattex, 1);
-            S("GL_EXT_color_buffer_float ", floatfbo, 1);
-            S("GL_EXT_color_buffer_half_float ", halffloatfbo, 1);
         }
     }
-    S("GL_AOS4_texture_format_RGB332", rgb332, 0);
-    S("GL_AOS4_texture_format_RGB332REV", rgb332rev, 0);
-    S("GL_AOS4_texture_format_RGBA1555REV", rgba1555rev, 1);
-    S("GL_AOS4_texture_format_RGBA8888", rgba8888, 1);
-    S("GL_AOS4_texture_format_RGBA8888REV", rgba8888rev, 1);
 
-    if (hardext.esversion>1) {
-        // -----------------------------------------------------------------
-        // ES 3.0+ promotes many OES extensions to core.
-        // Set them unconditionally for ES3 to avoid depending on Exts string.
-        // -----------------------------------------------------------------
-        if(hardext.esversion >= 3) {
-            // highp in fragment is mandatory in ES 3.0 (section 4.5.4 of spec)
-            if(!globals4es.nohighp)
-                hardext.highp = 2;
-            // textureLod / textureGrad are core GLSL ES 3.00 — no extension needed
-            if(!globals4es.noshaderlod)
-                hardext.shaderlod = 1;
-            // gl_FragDepth is core in GLSL ES 3.00
-            hardext.fragdepth = 1;
-            // dFdx/dFdy are core in ES 3.0
-            hardext.derivatives = 1;
-            // glMapBufferRange is core in ES 3.0 (replaces OES_mapbuffer)
-            hardext.mapbuffer = 1;
-            SHUT_LOGD("ES3 core features activated: highp, shaderlod, fragdepth, derivatives, mapbuffer\n");
-        } else {
-            // ES 2.0 path: check via extension string
-            if(!globals4es.nohighp) {
-                S("GL_OES_fragment_precision_high ", highp, 1);
-                if(!hardext.highp) {
-                    LOAD_GLES2(glGetShaderPrecisionFormat);
-                    if(gles_glGetShaderPrecisionFormat) {
-                        GLint range[2] = {0};
-                        GLint precision = 0;
-                        gles_glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, range, &precision);
-                        if(!(range[0]==0 && range[1]==0 && precision==0)) {
-                            hardext.highp = 2;
-                            SHUT_LOGD("high precision float in fragment shader available and used\n");
-                        }
-                    }
+    // Fragment precision high (ES2 legacy)
+    if (hardext.esversion == 2 && !globals4es.nohighp) {
+        EXT_CHECK_I("GL_OES_fragment_precision_high", highp);
+        if (!hardext.highp) {
+            LOAD_GLES2(glGetShaderPrecisionFormat);
+            if (gles_glGetShaderPrecisionFormat) {
+                GLint range[2] = {0}, precision = 0;
+                gles_glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER,
+                    0x8DF5 /* GL_HIGH_FLOAT */, range, &precision);
+                if (!(range[0] == 0 && range[1] == 0 && precision == 0)) {
+                    hardext.highp = 2;
+                    SHUT_LOGD("highp float fragment: tersedia (native)\n");
                 }
             }
-            if(!globals4es.noshaderlod)
-                S("GL_EXT_shader_texture_lod", shaderlod, 1);
-            S("GL_EXT_frag_depth ", fragdepth, 1);
-            S("GL_OES_standard_derivatives ", derivatives, 1);
-        }
-        // cubelod test applies to both ES2 and ES3 (driver quirk detection)
-        if(hardext.shaderlod) {
-            if(testTextureCubeLod()) {
-                hardext.cubelod = 1;
-                SHUT_LOGD("textureCubeLod in fragment doesn't need trailing EXT\n");
-            }
-        }
-        gles_glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &hardext.maxvattrib);
-        SHUT_LOGD("Max vertex attrib: %d\n", hardext.maxvattrib);
-        S("GL_ARM_shader_framebuffer_fetch", shader_fbfetch, 1);
-        // Program binary: ES3 always has it; ES2 needs extension
-        if(hardext.esversion >= 3) {
-            hardext.prgbinary = 1;
-        } else {
-            S("GL_OES_get_program ", prgbinary, 1);
-            if(!hardext.prgbinary)
-                S("GL_OES_get_program_binary ", prgbinary, 1);
-        }
-        if(hardext.prgbinary) {
-            gles_glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS_OES, &hardext.prgbin_n);
-            SHUT_LOGD("Number of supported Program Binary Format: %d\n", hardext.prgbin_n);
         }
     }
-    // Now get some max stuffs
+
+    // ES1-only extensions
+    if (hardext.esversion < 2) {
+        if (hasExtension(Exts, "GL_OES_framebuffer_object ")) hardext.fbo = 1;
+        if (hasExtension(Exts, "GL_OES_point_sprite "))       hardext.pointsprite = 1;
+        if (hasExtension(Exts, "GL_OES_texture_cube_map "))   hardext.cubemap = 1;
+        if (hasExtension(Exts, "GL_EXT_blend_color "))        hardext.blendcolor = 1;
+        if (hasExtension(Exts, "GL_OES_blend_subtract "))     hardext.blendsub = 1;
+        if (hasExtension(Exts, "GL_OES_blend_func_separate "))hardext.blendfunc = 1;
+        if (hasExtension(Exts, "GL_OES_blend_equation_separate ")) hardext.blendeq = 1;
+        if (hasExtension(Exts, "GL_OES_texture_mirrored_repeat ")) hardext.mirrored = 1;
+        if (hasExtension(Exts, "GL_OES_element_index_uint ")) hardext.elementuint = 1;
+        if (hasExtension(Exts, "GL_OES_packed_depth_stencil "))hardext.depthstencil = 1;
+        if (hasExtension(Exts, "GL_OES_depth24 "))             hardext.depth24 = 1;
+        if (hasExtension(Exts, "GL_OES_rgb8_rgba8 "))          hardext.rgba8 = 1;
+        if (hasExtension(Exts, "GL_EXT_blend_minmax "))        hardext.blendminmax = 1;
+        // AmigaOS4
+        if (hasExtension(Exts, "GL_AOS4_texture_format_RGB332"))     hardext.rgb332 = 1;
+        if (hasExtension(Exts, "GL_AOS4_texture_format_RGB332REV"))  hardext.rgb332rev = 1;
+        if (hasExtension(Exts, "GL_AOS4_texture_format_RGBA1555REV"))hardext.rgba1555rev = 1;
+        if (hasExtension(Exts, "GL_AOS4_texture_format_RGBA8888"))   hardext.rgba8888 = 1;
+        if (hasExtension(Exts, "GL_AOS4_texture_format_RGBA8888REV"))hardext.rgba8888rev = 1;
+    }
+
+    // =========================================================================
+    //  Batas hardware — query GL integers
+    // =========================================================================
     gles_glGetIntegerv(GL_MAX_TEXTURE_SIZE, &hardext.maxsize);
     SHUT_LOGD("Max texture size: %d\n", hardext.maxsize);
-    gles_glGetIntegerv((hardext.esversion==1)?GL_MAX_TEXTURE_UNITS:GL_MAX_TEXTURE_IMAGE_UNITS, &hardext.maxtex);
-    if (hardext.esversion==1) {
-        gles_glGetIntegerv(GL_MAX_LIGHTS, &hardext.maxlights);
-        gles_glGetIntegerv(GL_MAX_CLIP_PLANES, &hardext.maxplanes);
-        hardext.maxteximage=hardext.maxtex;
+
+    if (hardext.esversion == 1) {
+        gles_glGetIntegerv(GL_MAX_TEXTURE_UNITS, &hardext.maxtex);
+        gles_glGetIntegerv(GL_MAX_LIGHTS,        &hardext.maxlights);
+        gles_glGetIntegerv(GL_MAX_CLIP_PLANES,   &hardext.maxplanes);
+        hardext.maxteximage = hardext.maxtex;
     } else {
-        // simulated stuff using the FPE
-        hardext.maxlights = 8;
-        hardext.maxplanes = 6;
         gles_glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &hardext.maxteximage);
-        gles_glGetIntegerv(GL_MAX_VARYING_VECTORS, &hardext.maxvarying);
-        SHUT_LOGD("Max Varying Vector: %d\n", hardext.maxvarying);
-        if(hardext.maxvattrib<16 && hardext.maxtex>4)
-            hardext.maxtex = 4; // with less then 16 vertexattrib, more then 4 textures seems unreasonnable
+        gles_glGetIntegerv(GL_MAX_VERTEX_ATTRIBS,      &hardext.maxvattrib);
+        gles_glGetIntegerv(GL_MAX_VARYING_VECTORS,     &hardext.maxvarying);
+        hardext.maxtex = hardext.maxteximage;
+        SHUT_LOGD("MaxVAttrib=%d MaxVaryVec=%d MaxTexImg=%d\n",
+                  hardext.maxvattrib, hardext.maxvarying, hardext.maxteximage);
+        // Heuristik: GPU dengan < 16 attrib biasanya tidak bisa tangani
+        // lebih dari 4 texture unit secara efisien di shader generated FPE
+        if (hardext.maxvattrib < 16 && hardext.maxtex > 4)
+            hardext.maxtex = 4;
     }
-    int hardmaxtex = hardext.maxtex;
-    if(hardext.maxtex>MAX_TEX) hardext.maxtex=MAX_TEX;      // caping, as there are some fixed-sized array...
-    if(hardext.maxteximage>MAX_TEX) hardext.maxteximage=MAX_TEX;
-    if(hardext.maxlights>MAX_LIGHT) hardext.maxlights=MAX_LIGHT;                // caping lights too
-    if(hardext.maxplanes>MAX_CLIP_PLANES) hardext.maxplanes=MAX_CLIP_PLANES;    // caping planes, even 6 should be the max supported anyway
-    SHUT_LOGD("Texture Units: %d/%d (hardware: %d), Max lights: %d, Max planes: %d\n", hardext.maxtex, hardext.maxteximage, hardmaxtex, hardext.maxlights, hardext.maxplanes);
-    S("GL_EXT_texture_filter_anisotropic ", aniso, 1);
-    if(hardext.aniso) {
-        gles_glGetIntegerv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &hardext.aniso);
-        if(gles_glGetError()!=GL_NO_ERROR)
-            hardext.aniso = 0;
-        if(hardext.aniso)
-            SHUT_LOGD("Max Anisotropic filtering: %d\n", hardext.aniso);
+
+    // MSAA max samples (ES 3.0+)
+    if (hardext.esversion >= 3) {
+        gles_glGetIntegerv(0x8D57 /* GL_MAX_SAMPLES */, &hardext.maxsamples);
+        SHUT_LOGD("Max MSAA samples: %d\n", hardext.maxsamples);
     }
-    if(hardext.drawbuffers) {
-        gles_glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS_EXT,&hardext.maxcolorattach);
-        gles_glGetIntegerv(GL_MAX_DRAW_BUFFERS_ARB, &hardext.maxdrawbuffers);
+
+    // Draw buffers limits
+    if (hardext.drawbuffers) {
+        gles_glGetIntegerv(0x8CE0 /* GL_MAX_COLOR_ATTACHMENTS */,
+                           &hardext.maxcolorattach);
+        gles_glGetIntegerv(0x8824 /* GL_MAX_DRAW_BUFFERS */,
+                           &hardext.maxdrawbuffers);
     }
-    if(hardext.maxcolorattach<1)
-        hardext.maxcolorattach = 1;
-    if(hardext.maxcolorattach>MAX_DRAW_BUFFERS)
-        hardext.maxcolorattach=MAX_DRAW_BUFFERS;
-    if(hardext.maxdrawbuffers<1)
-        hardext.maxdrawbuffers = 1;
-    if(hardext.maxdrawbuffers>MAX_DRAW_BUFFERS)
-        hardext.maxdrawbuffers=MAX_DRAW_BUFFERS;
-    SHUT_LOGD("Max Color Attachments: %d / Draw buffers: %d\n", hardext.maxdrawbuffers, hardext.maxcolorattach);
-    // get GLES driver signatures...
-    const char *vendor = (const char *) gles_glGetString(GL_VENDOR);
-    if (!vendor) vendor = "Unknown";
-    SHUT_LOGD("Hardware vendor is %s\n", vendor);
-    if(!gl4es_original_vendor) {
-        gl4es_original_vendor = strdup(vendor);
+
+    // Sanitize & cap semua batas
+    {
+        int hardmaxtex = hardext.maxtex;
+        if (hardext.maxtex      > MAX_TEX)         hardext.maxtex      = MAX_TEX;
+        if (hardext.maxteximage > MAX_TEX)          hardext.maxteximage = MAX_TEX;
+        if (hardext.maxlights   > MAX_LIGHT)        hardext.maxlights   = MAX_LIGHT;
+        if (hardext.maxplanes   > MAX_CLIP_PLANES)  hardext.maxplanes   = MAX_CLIP_PLANES;
+        if (hardext.maxcolorattach < 1)             hardext.maxcolorattach = 1;
+        if (hardext.maxcolorattach > MAX_DRAW_BUFFERS) hardext.maxcolorattach = MAX_DRAW_BUFFERS;
+        if (hardext.maxdrawbuffers < 1)             hardext.maxdrawbuffers = 1;
+        if (hardext.maxdrawbuffers > MAX_DRAW_BUFFERS) hardext.maxdrawbuffers = MAX_DRAW_BUFFERS;
+        SHUT_LOGD("TexUnits: %d/%d (hw:%d) Lights:%d Planes:%d ColorAttach:%d DrawBuf:%d\n",
+                  hardext.maxtex, hardext.maxteximage, hardmaxtex,
+                  hardext.maxlights, hardext.maxplanes,
+                  hardext.maxcolorattach, hardext.maxdrawbuffers);
     }
-    if(strstr(vendor, "ARM"))
-        hardext.vendor = VEND_ARM;
-    else if(strstr(vendor, "Imagination Technologies"))
-        hardext.vendor = VEND_IMGTEC;
-    if(hardext.esversion>1) {
-        if(testGLSL("#version 120", 1))
+
+    // =========================================================================
+    //  GLSL version probe — compile shader uji
+    //  Urutan: 320 es → 310 es → 300 es → 120 (desktop compat)
+    //
+    //  Catatan penting:
+    //  - GLSL ES 3.00+ wajib pakai 'in' (bukan 'attribute')
+    //  - GLSL ES 1.00 / GLSL 1.20 pakai 'attribute'
+    //  - Kita hanya probe versi yang masuk akal untuk backend yang ada
+    // =========================================================================
+    if (hardext.esversion >= 2) {
+        if (hardext_is_gles32()) {
+            if (testGLSL("#version 320 es", 1)) {
+                hardext.glsl320es = 1;
+                SHUT_LOGD("GLSL ES 3.20: TERSEDIA ✓ (target utama)\n");
+            } else {
+                SHUT_LOGD("GLSL ES 3.20: tidak dikompilasi (driver tidak mendukung)\n");
+            }
+        }
+        if (hardext.esversion == 3 && hardext.esminor >= 1 && !hardext.glsl320es) {
+            if (testGLSL("#version 310 es", 1)) {
+                hardext.glsl310es = 1;
+                SHUT_LOGD("GLSL ES 3.10: tersedia\n");
+            }
+        }
+        if (hardext.esversion >= 3 && !hardext.glsl320es && !hardext.glsl310es) {
+            if (testGLSL("#version 300 es", 1)) {
+                hardext.glsl300es = 1;
+                SHUT_LOGD("GLSL ES 3.00: tersedia\n");
+            }
+        }
+        // GLSL 1.20 desktop compat (dipakai shaderconv untuk konversi)
+        if (testGLSL("#version 120", 0)) {
             hardext.glsl120 = 1;
-        if(testGLSL("#version 300 es", 0))
-            hardext.glsl300es = 1;
-        if(testGLSL("#version 310 es", 1))
-            hardext.glsl310es = 1;
-        // ES 3.2 context guarantees GLSL ES 3.20.
-        // On confirmed ES 3.2 contexts the flag is set directly (no shader compile needed).
-        // On ES 3.0/3.1 contexts we still test in case the driver supports it via extension.
-        if(hardext.esversion >= 3 && hardext.es_minor >= 2) {
-            hardext.glsl320es = 1;
-        } else if(testGLSL("#version 320 es", 0)) {
-            hardext.glsl320es = 1;
+            SHUT_LOGD("GLSL 1.20: tersedia\n");
         }
     }
-    if(!gl4es_original_renderer) {
-        const char* renderer = (const char *) gles_glGetString(GL_RENDERER);
-        gl4es_original_renderer = strdup(renderer);
-    }
-    if(hardext.glsl120)
-        SHUT_LOGD("GLSL 120 supported and used\n");
-    if(hardext.glsl300es)
-        SHUT_LOGD("GLSL 300 es supported%s\n", (hardext.glsl120||hardext.glsl310es)?"":" and used");
-    if(hardext.glsl310es)
-        SHUT_LOGD("GLSL 310 es supported%s\n", hardext.glsl120?"":" and used");
-    if(hardext.glsl320es)
-        SHUT_LOGD("GLSL 320 es supported and used\n");
 
+    // Ringkasan GLSL
+    SHUT_LOGD("GLSL summary: 120=%d 300es=%d 310es=%d 320es=%d\n",
+              hardext.glsl120, hardext.glsl300es,
+              hardext.glsl310es, hardext.glsl320es);
+
+    // =========================================================================
+    //  EGL extension check (setelah context aktif)
+    // =========================================================================
 #ifndef NOEGL
-    if(strstr(egl_eglQueryString(eglDisplay, EGL_EXTENSIONS), "EGL_KHR_gl_colorspace")) {
-        SHUT_LOGD("sRGB surface supported\n");
-        hardext.srgb = 1;
-    }
-    if(strstr(egl_eglQueryString(eglDisplay, EGL_EXTENSIONS), "EGL_KHR_image_pixmap")) {
-        SHUT_LOGD("EGLImage from Pixmap supported\n");
-        hardext.khr_pixmap = 1;
-    }
-    if(strstr(egl_eglQueryString(eglDisplay, EGL_EXTENSIONS), "EGL_KHR_gl_texture_2D_image")) {
-        SHUT_LOGD("EGLImage to Texture2D supported\n");
-        hardext.khr_texture_2d = 1;
-    }
-    if(strstr(egl_eglQueryString(eglDisplay, EGL_EXTENSIONS), "EGL_KHR_gl_renderbuffer_image")) {
-        SHUT_LOGD("EGLImage to RenderBuffer supported\n");
-        hardext.khr_renderbuffer = 1;
+    {
+        const char* eglExts = egl_eglQueryString(eglDisplay, EGL_EXTENSIONS);
+        if (eglExts) {
+            if (hasExtension(eglExts, "EGL_KHR_gl_colorspace")) {
+                hardext.srgb = 1;
+                SHUT_LOGD("EGL: sRGB surface support\n");
+            }
+            if (hasExtension(eglExts, "EGL_KHR_image_pixmap")) {
+                hardext.khr_pixmap = 1;
+                SHUT_LOGD("EGL: EGLImage from Pixmap\n");
+            }
+            if (hasExtension(eglExts, "EGL_KHR_gl_texture_2D_image")) {
+                hardext.khr_texture_2d = 1;
+                SHUT_LOGD("EGL: EGLImage to Texture2D\n");
+            }
+            if (hasExtension(eglExts, "EGL_KHR_gl_renderbuffer_image")) {
+                hardext.khr_renderbuffer = 1;
+                SHUT_LOGD("EGL: EGLImage to RenderBuffer\n");
+            }
+        }
     }
 
-    // End, cleanup
-    egl_eglMakeCurrent(eglDisplay, 0, 0, EGL_NO_CONTEXT);
+    // ── Cleanup ─────────────────────────────────────────────────────────────
+    egl_eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     egl_eglDestroySurface(eglDisplay, eglSurface);
     egl_eglDestroyContext(eglDisplay, eglContext);
-
     egl_eglTerminate(eglDisplay);
-#endif
+#endif  // !NOEGL
+
+    SHUT_LOGD("GetHardwareExtensions selesai (ES %d.%d, vendor=%d)\n",
+              hardext.esversion, hardext.esminor, hardext.vendor);
 }

@@ -7,6 +7,11 @@
 #define AliasExport(name)   __attribute__((alias(name))) __attribute__((visibility("default")))
 #endif
 
+static EGLint egl_context_attrib_es3[] = {
+    EGL_CONTEXT_MAJOR_VERSION, 3,
+    EGL_CONTEXT_MINOR_VERSION, 2,
+    EGL_NONE
+};
 static EGLint egl_context_attrib_es2[] = {
     EGL_CONTEXT_CLIENT_VERSION, 2,
     EGL_NONE
@@ -136,7 +141,10 @@ EGLBoolean gl4es_eglSwapInterval(EGLDisplay dpy, EGLint interval) {
 
 EGLContext gl4es_eglCreateContext(EGLDisplay dpy, EGLConfig config, EGLContext share_context, const EGLint *attrib_list) {
     LOAD_EGL(eglCreateContext);
-    return egl_eglCreateContext(dpy, config, share_context, (hardext.esversion == 1) ? egl_context_attrib : egl_context_attrib_es2);
+    return egl_eglCreateContext(dpy, config, share_context,
+        (hardext.esversion == 1) ? egl_context_attrib :
+        (hardext.esversion >= 3) ? egl_context_attrib_es3 :
+        egl_context_attrib_es2);
 }
 
 EGLBoolean gl4es_eglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
