@@ -283,10 +283,55 @@ static const char* gl_TexMatrixSources[] = {
 };
 
 static const char* GLESHeader[] = {
+  /* [0] GLSL ES 1.00 — texture2D/textureCube are native */
   "#version 100\n%sprecision %s float;\nprecision %s int;\n",
+  /* [1] GLSL 1.20 (desktop) */
   "#version 120\n%sprecision %s float;\nprecision %s int;\n",
-  "#version 310 es\n#define attribute in\n#define varying out\n%sprecision %s float;\nprecision %s int;\n",
-  "#version 300 es\n#define attribute in\n#define varying out\n%sprecision %s float;\nprecision %s int;\n"
+  /* [2] GLSL ES 3.10 — texture2D/textureCube/gl_FragDepthEXT remapped to core names */
+  "#version 310 es\n"
+  "#define attribute in\n"
+  "#define varying out\n"
+  "#define texture2D texture\n"
+  "#define texture2DProj textureProj\n"
+  "#define textureCube texture\n"
+  "#define gl_FragDepthEXT gl_FragDepth\n"
+  "#define texture2DLodEXT textureLod\n"
+  "#define texture2DProjLodEXT textureProjLod\n"
+  "#define textureCubeLodEXT textureLod\n"
+  "#define texture2DGradEXT textureGrad\n"
+  "#define texture2DProjGradEXT textureProjGrad\n"
+  "#define textureCubeGradEXT textureGrad\n"
+  "%sprecision %s float;\nprecision %s int;\n",
+  /* [3] GLSL ES 3.00 — same remapping, no EXT suffix needed */
+  "#version 300 es\n"
+  "#define attribute in\n"
+  "#define varying out\n"
+  "#define texture2D texture\n"
+  "#define texture2DProj textureProj\n"
+  "#define textureCube texture\n"
+  "#define gl_FragDepthEXT gl_FragDepth\n"
+  "#define texture2DLodEXT textureLod\n"
+  "#define texture2DProjLodEXT textureProjLod\n"
+  "#define textureCubeLodEXT textureLod\n"
+  "#define texture2DGradEXT textureGrad\n"
+  "#define texture2DProjGradEXT textureProjGrad\n"
+  "#define textureCubeGradEXT textureGrad\n"
+  "%sprecision %s float;\nprecision %s int;\n",
+  /* [4] GLSL ES 3.20 — full core, same remapping (location on uniform not supported in [3]) */
+  "#version 320 es\n"
+  "#define attribute in\n"
+  "#define varying out\n"
+  "#define texture2D texture\n"
+  "#define texture2DProj textureProj\n"
+  "#define textureCube texture\n"
+  "#define gl_FragDepthEXT gl_FragDepth\n"
+  "#define texture2DLodEXT textureLod\n"
+  "#define texture2DProjLodEXT textureProjLod\n"
+  "#define textureCubeLodEXT textureLod\n"
+  "#define texture2DGradEXT textureGrad\n"
+  "#define texture2DProjGradEXT textureProjGrad\n"
+  "#define textureCubeGradEXT textureGrad\n"
+  "%sprecision %s float;\nprecision %s int;\n"
 };
 
 static const char* gl4es_transpose =
@@ -501,6 +546,7 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need)
      version120 = 1;
   if(version120) {
     if(hardext.glsl120) versionHeader = 1;
+    else if(hardext.glsl320es) versionHeader = 4;   /* #version 320 es — ES 3.2 context */
     else if(hardext.glsl310es) versionHeader = 2;
     else if(hardext.glsl300es) { versionHeader = 3; /* location on uniform not supported ! */ }
     /* else no location or in / out are supported */
@@ -567,12 +613,15 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need)
   "float fwidth(float p) {return abs(dFdx(p))+abs(dFdy(p));}\nvec2 fwidth(vec2 p) {return abs(dFdx(p))+abs(dFdy(p));}\n"
   "vec3 fwidth(vec3 p) {return abs(dFdx(p))+abs(dFdy(p));}\n";
   if (derivatives) {
-    /* If #extension is used, it should be placed before the second line of the header. */
-    if(hardext.derivatives)
-      Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, 1), GLESUseDerivative, Tmp, &tmpsize);
-    else
-      Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, headline-1), GLESFakeDerivative, Tmp, &tmpsize);
-    headline++;
+    // ES3+: dFdx/dFdy/fwidth are core in GLSL ES 3.00+. No extension directive needed.
+    // ES2 path: inject extension enable or emulation code.
+    if(hardext.esversion < 3) {
+      if(hardext.derivatives)
+        Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, 1), GLESUseDerivative, Tmp, &tmpsize);
+      else
+        Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, headline-1), GLESFakeDerivative, Tmp, &tmpsize);
+      headline++;
+    }
   }
   // check if draw_buffers may be used (no fallback here :( )
   if(hardext.maxdrawbuffers>1 && strstr(pBuffer, "gl_FragData[")) {
@@ -601,8 +650,12 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need)
   || gl4es_find_string(Tmp, "textureCubeLod") 
   || gl4es_find_string(Tmp, "texture2DGradARB") || gl4es_find_string(Tmp, "texture2DProjGradARB")|| gl4es_find_string(Tmp, "textureCubeGradARB") 
   )) {
-      const char* GLESUseShaderLod = "#extension GL_EXT_shader_texture_lod : enable\n";
-      Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, 1), GLESUseShaderLod, Tmp, &tmpsize);
+      // ES3+: all LOD/Grad functions are core in GLSL ES 3.00+.
+      // GLESHeader macros remap *EXT names to core names — no #extension directive needed.
+      if(hardext.esversion < 3) {
+        const char* GLESUseShaderLod = "#extension GL_EXT_shader_texture_lod : enable\n";
+        Tmp = gl4es_inplace_insert(gl4es_getline(Tmp, 1), GLESUseShaderLod, Tmp, &tmpsize);
+      }
   }
   if(!isVertex && (gl4es_find_string(Tmp, "texture2DLod"))) {
       if(hardext.shaderlod) {
@@ -719,7 +772,11 @@ char* ConvertShader(const char* pEntry, int isVertex, shaderconv_need_t *need)
     }
     newptr++;
   }
-  Tmp = gl4es_inplace_replace(Tmp, &tmpsize, "gl_FragDepth", (hardext.fragdepth)?"gl_FragDepthEXT":"fakeFragDepth");
+  // ES3: gl_FragDepth is core (native name). GLESHeader macro maps gl_FragDepthEXT -> gl_FragDepth.
+  // ES2: replace gl_FragDepth with gl_FragDepthEXT (extension) or fakeFragDepth (emulation).
+  if(hardext.esversion < 3) {
+    Tmp = gl4es_inplace_replace(Tmp, &tmpsize, "gl_FragDepth", (hardext.fragdepth)?"gl_FragDepthEXT":"fakeFragDepth");
+  }
   // builtin attribs
   if(isVertex) {
       // check for ftransform function

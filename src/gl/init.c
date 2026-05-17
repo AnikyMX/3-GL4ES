@@ -177,6 +177,7 @@ void initialize_gl4es() {
     switch(globals4es.es) {
       case 1:
       case 2:
+      case 3:   // ES 3.x — actual minor version negotiated at runtime by hardext
         break;
       default:
         // automatic ES backend selection
@@ -207,11 +208,15 @@ void initialize_gl4es() {
         break;
       default:
         // automatic GL version selection
-        globals4es.gl = (globals4es.es==1)?15:21;  // forcing GL 1.5 for es1.1 and GL 2.1 for es2.0
+        // ES 3.x still reports GL 2.1 to Minecraft for Fixed Pipeline compatibility
+        globals4es.gl = (globals4es.es==1)?15:21;
         break;
     }
 
-    SHUT_LOGD("Using GLES %s backend\n", (globals4es.es==1)?"1.1":"2.0");
+    SHUT_LOGD("Using GLES %s backend\n",
+        (globals4es.es==1) ? "1.1" :
+        (globals4es.es==3) ? "3.x (negotiated at context creation)" :
+                             "2.0");
 
     env(LIBGL_NODEPTHTEX, globals4es.nodepthtex, "Disable usage of Depth Textures");
 

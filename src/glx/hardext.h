@@ -70,7 +70,9 @@ typedef struct _hardext {
     int shader_fbfetch; // GL_ARM_shader_framebuffer_fetch
     int glsl120;        // does version 120 glsl shader are supported ?
     int glsl300es;      // does version 300es glsl shader are supported ?
-    int glsl310es;      // does version 300es glsl shader are supported ?
+    int glsl310es;      // does version 310es glsl shader are supported ?
+    int glsl320es;      // does version 320es glsl shader are supported ? (ES 3.2 context required)
+    int es_minor;       // minor version of the negotiated ES context (0 for ES3.0, 2 for ES3.2)
 } hardext_t;
 
 EXPORT extern hardext_t hardext;

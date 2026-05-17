@@ -110,10 +110,13 @@ if(GOA_CLONE)
     set(GLX_STUBS ON)
 endif()
 
-# Android
+# Android — target GLES 3.2 backend by default (API 24+, NDK r28+)
+# DEFAULT_ES=3 enables the 3-tier EGL fallback: ES3.2 -> ES3.0 -> ES2.0
+# The actual negotiated version is stored in hardext.esversion at runtime.
 if(ANDROID)
     add_definitions(-DANDROID)
-    add_definitions(-DNOX11 -DNO_GBM -DDEFAULT_ES=2)
+    add_definitions(-DNOX11 -DNO_GBM)
+    set(DEFAULT_ES 3)
 endif()
 
 if(USE_ANDROID_LOG)
@@ -200,6 +203,11 @@ if(DEFAULT_ES EQUAL 2)
 endif()
 if(DEFAULT_ES EQUAL 1)
     add_definitions(-DDEFAULT_ES=1)
+endif()
+# DEFAULT_ES=3: request GLES 3.2 at runtime (falls back to 3.0 then 2.0)
+# Links against libGLESv3 via dlopen in loader.c — no static link needed.
+if(DEFAULT_ES EQUAL 3)
+    add_definitions(-DDEFAULT_ES=3)
 endif()
 if(USE_CCACHE)
     find_program(CCACHE_FOUND ccache)
